@@ -1,0 +1,88 @@
+# VirtualService — study-platform canary routing
+#
+# Defines traffic routing for the study-platform service.
+# At rest, 100% of traffic routes to subset v1 (current stable version)
+# and 0% to subset v2 (new version, not yet promoted).
+#
+# During a Rundeck prod-deploy job, this resource is patched in two phases:
+#
+#   Phase 1 — Canary (step 3):
+#     kubectl patch virtualservice study-platform -n study-platform \
+#       --type merge -p '{"spec":{"http":[{"route":[
+#         {"destination":{"host":"study-platform","subset":"v2"},"weight":10},
+#         {"destination":{"host":"study-platform","subset":"v1"},"weight":90}
+#       ]}]}}'
+#
+#   Phase 2 — Full rollout (step 6), after Prometheus error rate gate passes:
+#     kubectl patch virtualservice study-platform -n study-platform \
+#       --type merge -p '{"spec":{"http":[{"route":[
+#         {"destination":{"host":"study-platform","subset":"v2"},"weight":100}
+#       ]}]}}'
+#
+# After a successful deploy cycle, GitOps repo is updated so that v2 becomes
+# the new v1 in the next release. Weights are reset to 100/0 in git.
+#
+# The "timeout" and "retries" configuration applies to every request
+# regardless of which subset it routes to.
+#
+# Apply:
+#   kubectl apply -f istio/virtual-service.yaml --context eks-test-1
+#   kubectl apply -f istio/virtual-service.yaml --context eks-test-2
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: study-platform
+  namespace: study-platform
+  labels:
+    app: study-platform
+    app.kubernetes.io/name: study-platform
+    app.kubernetes.io/component: virtual-service
+    app.kubernetes.io/part-of: study-platform
+    app.kubernetes.io/managed-by: argocd
+spec:
+  # Bind to both the ingress gateway (external traffic) and mesh (internal traffic).
+  gateways:
+    - istio-system/study-platform-gateway
+    - mesh
+  hosts:
+    - "study-platform.example.com"   # external hostname (matches Gateway)
+    - "study-platform"               # internal short name (mesh traffic)
+    - "study-platform.study-platform.svc.cluster.local"
+  http:
+    # ---------------------------------------------------------------------------
+    # Primary HTTP route with canary weight split.
+    # Weights sum to 100. Patched by Rundeck during deploy.
+    # At rest: v1=100, v2=0 (stable production state).
+    # ---------------------------------------------------------------------------
+    - name: "canary-split"
+
+      # Timeout applies per request attempt (not total including retries).
+      timeout: "30s"
+
+      # Retry policy: retry on transient gateway and upstream errors.
+      # perTryTimeout must be < timeout / attempts to allow all retries.
+      retries:
+        attempts: 3
+        perTryTimeout: "10s"
+        retryOn: "gateway-error,connect-failure,retriable-4xx,503"
+
+      route:
+        # v1 — current stable version.
+        # This subset maps to pods labelled version=v1 (see DestinationRule).
+        # Receives 100% of traffic at rest, decreases to 90% during canary.
+        - destination:
+            host: study-platform
+            subset: v1
+            port:
+              number: 8080
+          weight: 100
+
+        # v2 — new version being promoted.
+        # Weight is 0 at rest; patched to 10 (canary) then 100 (full rollout)
+        # by the Rundeck prod-deploy job steps.
+        - destination:
+            host: study-platform
+            subset: v2
+            port:
+              number: 8080
+          weight: 0

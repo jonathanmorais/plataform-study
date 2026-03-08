@@ -1,0 +1,8 @@
+# CODEOWNERS - Defines required reviewers for pull requests
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Incident branches require manager approval before merge
+incidente/*  @managers-team
+
+# Infrastructure changes require platform-team review
+infra/**     @platform-team

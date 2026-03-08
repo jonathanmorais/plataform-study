@@ -1,0 +1,94 @@
+name: AMI Build
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+    paths:
+      - "infra/ansible/roles/**"
+      - "infra/ansible/playbooks/build-ami.yaml"
+
+permissions:
+  id-token: write
+  contents: read
+  actions: write
+
+jobs:
+  build-ami:
+    name: Build AMI with Ansible
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/ansible
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: ami-build-${{ github.run_id }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Ansible and dependencies
+        run: |
+          pip install --upgrade pip
+          pip install ansible boto3 botocore
+
+      - name: Install amazon.aws collection
+        run: |
+          ansible-galaxy collection install amazon.aws --force
+
+      - name: Validate Ansible playbook syntax
+        run: |
+          ansible-playbook \
+            -i inventory/hosts.yaml \
+            playbooks/build-ami.yaml \
+            --syntax-check
+
+      - name: Run AMI build playbook
+        run: |
+          ansible-playbook \
+            -i inventory/hosts.yaml \
+            playbooks/build-ami.yaml \
+            --extra-vars "build_version=${{ github.sha }} git_sha=${{ github.sha }}" \
+            -v
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_STDOUT_CALLBACK: yaml
+
+      - name: Verify AMI ID was stored in SSM
+        run: |
+          AMI_ID=$(aws ssm get-parameter \
+            --name "/platform/ami/latest" \
+            --query "Parameter.Value" \
+            --output text)
+          echo "AMI built successfully: $AMI_ID"
+          echo "AMI_ID=$AMI_ID" >> "$GITHUB_ENV"
+
+      - name: Trigger infra workflow
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'infra.yaml',
+              ref: context.ref,
+              inputs: {
+                triggered_by: 'ami-build',
+                ami_id: process.env.AMI_ID,
+                git_sha: context.sha,
+              }
+            });
+            core.info('Triggered infra.yaml workflow successfully');

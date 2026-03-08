@@ -1,0 +1,237 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: study-platform
+  namespace: study-platform
+  labels:
+    app: study-platform
+    app.kubernetes.io/name: study-platform
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: study-platform
+    version: v1
+  annotations:
+    # Sync wave 0 — Namespace (-2) and ConfigMap (-1) must exist first
+    argocd.argoproj.io/sync-wave: "0"
+    # Istio sidecar injection is controlled by the namespace label;
+    # this annotation overrides per-pod if needed
+    sidecar.istio.io/inject: "true"
+spec:
+  # Base replicas — overridden by overlay patches
+  replicas: 2
+  revisionHistoryLimit: 5
+
+  selector:
+    matchLabels:
+      app: study-platform
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Allow 1 extra pod during rollout so traffic is never dropped
+      maxSurge: 1
+      # Never go below minAvailable defined in PDB
+      maxUnavailable: 0
+
+  template:
+    metadata:
+      labels:
+        # app + version labels are required by Istio DestinationRule subsets
+        app: study-platform
+        version: v1
+        app.kubernetes.io/name: study-platform
+        app.kubernetes.io/component: backend
+      annotations:
+        # Force pod restart when ConfigMap changes (checksum-based rollout)
+        checksum/config: "KUSTOMIZE_WILL_OVERRIDE_WITH_HASH"
+        # Prometheus scrape config — Istio also exposes /metrics via envoy
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+        # Exclude liveness/readiness ports from Istio redirect so the kubelet
+        # can reach them without mTLS
+        traffic.sidecar.istio.io/excludeInboundPorts: ""
+
+    spec:
+      # Prefer spreading pods across AZs and nodes
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: study-platform
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: study-platform
+
+      affinity:
+        podAntiAffinity:
+          # Soft anti-affinity — prefer different nodes
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: study-platform
+                topologyKey: kubernetes.io/hostname
+
+      # Graceful shutdown — wait for in-flight requests before SIGKILL
+      terminationGracePeriodSeconds: 60
+
+      serviceAccountName: study-platform
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: study-platform
+          # Image is overridden by Kustomize image transformer in each overlay.
+          # CI updates the newTag field after pushing to ECR.
+          image: REGISTRY/study-platform:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          # ── Resource requests and limits ────────────────────────────────────
+          # Base values — overlays patch these per environment.
+          # Requests match HPA metrics baseline; limits prevent noisy-neighbour issues.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          # ── Health probes ───────────────────────────────────────────────────
+          # Startup probe gives the container time to boot before liveness kicks in
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 5
+            timeoutSeconds: 3
+
+          # Readiness: traffic only reaches the pod when this passes
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+
+          # Liveness: restart the pod if it stops responding
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+
+          # ── Environment variables ────────────────────────────────────────────
+          env:
+            # Non-sensitive config from ConfigMap
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: study-platform-config
+                  key: LOG_LEVEL
+
+            - name: APP_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: study-platform-config
+                  key: APP_ENV
+
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: study-platform-config
+                  key: PORT
+
+            # Sensitive config from Secret (created out-of-band; not in GitOps)
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: study-platform-secrets
+                  key: DATABASE_URL
+
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: study-platform-secrets
+                  key: SECRET_KEY
+
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: study-platform-config
+                  key: AWS_REGION
+
+            # Downward API — expose pod identity for structured logs
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+          # Writable tmpfs for ephemeral data (readOnlyRootFilesystem=true requires this)
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: app-cache
+              mountPath: /app/cache
+
+          lifecycle:
+            # Allow SIGTERM to drain in-flight connections before the pod is removed
+            # from the Service endpoints. Sleep matches Istio drain timeout.
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: app-cache
+          emptyDir: {}
+
+      # DNS config — use cluster DNS with explicit search domains
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"

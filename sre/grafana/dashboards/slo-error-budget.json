@@ -1,0 +1,444 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "uid": "platform-slo",
+  "title": "SLO / Error Budget — study-platform",
+  "description": "Service Level Objectives and error budget tracking for the study-platform. Shows 30-day availability and latency SLOs, burn rates, and remaining error budget.",
+  "tags": ["study-platform", "slo", "error-budget", "sre"],
+  "style": "dark",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["1m", "5m", "15m"],
+    "time_options": ["6h", "12h", "24h", "7d", "30d", "90d"]
+  },
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": "${DS_PROMETHEUS}",
+        "query": "label_values(up, cluster)",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Availability SLO — 30d",
+      "description": "Current 30-day availability. SLO target: 99.5%. Error budget: 3h 36m / month.",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 4,
+          "min": 0.98,
+          "max": 1.0,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.993 },
+              { "color": "green", "value": 0.995 }
+            ]
+          },
+          "mappings": []
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "showThresholdLabels": true,
+        "showThresholdMarkers": true,
+        "text": { "valueSize": 24 }
+      },
+      "targets": [
+        {
+          "expr": "1 - slo:error_rate:ratio_rate30d",
+          "legendFormat": "30d Availability",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Error Budget Remaining (30d)",
+      "description": "Fraction of the 30-day error budget remaining. 1.0 = full budget, 0 = exhausted (SLO breached). Budget = 3h 36m / month.",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "min": 0,
+          "max": 1,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.1 },
+              { "color": "yellow", "value": 0.25 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "showThresholdLabels": true,
+        "showThresholdMarkers": true,
+        "text": { "valueSize": 24 }
+      },
+      "targets": [
+        {
+          "expr": "slo:error_budget_remaining:ratio",
+          "legendFormat": "Budget Remaining",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Latency p95 SLO — Current",
+      "description": "Current p95 request latency. SLO target: 500ms.",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 0,
+          "min": 0,
+          "max": 2000,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 400 },
+              { "color": "orange", "value": 500 },
+              { "color": "red", "value": 1000 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "showThresholdLabels": true,
+        "showThresholdMarkers": true,
+        "text": { "valueSize": 24 }
+      },
+      "targets": [
+        {
+          "expr": "slo:latency_p95:seconds_rate5m * 1000",
+          "legendFormat": "p95 Latency",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Current Burn Rate",
+      "description": "Real-time burn rate multiplier. 14.4x = P1 threshold (budget exhausted in ~5h). 6x = P2 threshold.",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 3 },
+              { "color": "orange", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          },
+          "mappings": []
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "text": { "valueSize": 40 },
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "expr": "(\n  sum(rate(istio_requests_total{response_code=~\"5.*\"}[1h]))\n  /\n  sum(rate(istio_requests_total[1h]))\n) / 0.005",
+          "legendFormat": "1h Burn Rate",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Error Rate Trend — 30 Days",
+      "description": "30-day error rate trend with SLO target line (0.5%). Used to visualize error budget consumption over the month.",
+      "type": "timeseries",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 8 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 4,
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "SLO Target (0.5%)" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.lineWidth", "value": 1 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["mean", "max", "lastNotNull"]
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "slo:error_rate:ratio_rate5m",
+          "legendFormat": "Error Rate (5m avg)",
+          "refId": "A"
+        },
+        {
+          "expr": "slo:error_rate:ratio_rate1h",
+          "legendFormat": "Error Rate (1h avg)",
+          "refId": "B"
+        },
+        {
+          "expr": "vector(0.005)",
+          "legendFormat": "SLO Target (0.5%)",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Burn Rate — Multi-Window",
+      "description": "Burn rate across multiple time windows. Used to detect fast vs slow burns. P1 threshold: 14.4x (1h window). P2 threshold: 6x (6h window).",
+      "type": "timeseries",
+      "gridPos": { "h": 10, "w": 16, "x": 0, "y": 18 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "P1 Threshold (14.4x)" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 8] } },
+              { "id": "custom.lineWidth", "value": 1 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "P2 Threshold (6x)" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [6, 6] } },
+              { "id": "custom.lineWidth", "value": 1 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }
+      },
+      "targets": [
+        {
+          "expr": "(\n  sum(rate(istio_requests_total{response_code=~\"5.*\"}[1h]))\n  / sum(rate(istio_requests_total[1h]))\n) / 0.005",
+          "legendFormat": "1h Burn Rate",
+          "refId": "A"
+        },
+        {
+          "expr": "(\n  sum(rate(istio_requests_total{response_code=~\"5.*\"}[6h]))\n  / sum(rate(istio_requests_total[6h]))\n) / 0.005",
+          "legendFormat": "6h Burn Rate",
+          "refId": "B"
+        },
+        {
+          "expr": "(\n  sum(rate(istio_requests_total{response_code=~\"5.*\"}[3d]))\n  / sum(rate(istio_requests_total[3d]))\n) / 0.005",
+          "legendFormat": "3d Burn Rate",
+          "refId": "C"
+        },
+        {
+          "expr": "vector(14.4)",
+          "legendFormat": "P1 Threshold (14.4x)",
+          "refId": "D"
+        },
+        {
+          "expr": "vector(6)",
+          "legendFormat": "P2 Threshold (6x)",
+          "refId": "E"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Active Burn Rate Alerts",
+      "description": "Currently firing SLO burn rate alerts.",
+      "type": "table",
+      "gridPos": { "h": 10, "w": 8, "x": 16, "y": 18 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "severity" },
+            "properties": [
+              { "id": "custom.displayMode", "value": "color-background" },
+              {
+                "id": "mappings",
+                "value": [
+                  { "type": "value", "options": { "P1": { "color": "red" } } },
+                  { "type": "value", "options": { "P2": { "color": "orange" } } }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": { "showHeader": true },
+      "transformations": [
+        { "id": "labelsToFields", "options": { "mode": "rows" } },
+        {
+          "id": "filterFieldsByName",
+          "options": { "include": { "names": ["alertname", "severity", "cluster", "summary"] } }
+        }
+      ],
+      "targets": [
+        {
+          "expr": "ALERTS{slo=\"availability\", alertstate=\"firing\"}",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "p95 Latency — 30 Day Trend",
+      "description": "30-day p95 latency trend with SLO target (500ms) and critical threshold (1s).",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "SLO Target (500ms)" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 8] } },
+              { "id": "custom.lineWidth", "value": 1 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "P1 Threshold (1000ms)" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.lineWidth", "value": 1 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "slo:latency_p95:seconds_rate5m * 1000",
+          "legendFormat": "p95 Latency",
+          "refId": "A"
+        },
+        {
+          "expr": "slo:latency_p99:seconds_rate5m * 1000",
+          "legendFormat": "p99 Latency",
+          "refId": "B"
+        },
+        {
+          "expr": "vector(500)",
+          "legendFormat": "SLO Target (500ms)",
+          "refId": "C"
+        },
+        {
+          "expr": "vector(1000)",
+          "legendFormat": "P1 Threshold (1000ms)",
+          "refId": "D"
+        }
+      ]
+    }
+  ]
+}

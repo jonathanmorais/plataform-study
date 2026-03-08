@@ -1,0 +1,388 @@
+---
+# =============================================================================
+# playbooks/02-install-istio.yaml
+#
+# Day-0: Install Istio {{ istio_version }} on eks-test-1 and eks-test-2 using
+# the multi-primary topology.  Each cluster acts as both a control-plane and a
+# data-plane; cross-cluster service discovery is set up in playbooks 03 & 04.
+#
+# Usage:
+#   ansible-playbook playbooks/02-install-istio.yaml
+#
+# Prerequisites:
+#   - 01-seed-cacerts.yaml must have succeeded (cacerts secret must exist)
+#   - Valid kubeconfigs for eks-test-1 and eks-test-2
+# =============================================================================
+
+- name: "02-install-istio | Install Istio multi-primary on spoke clusters"
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    _istioctl_tmp: "/tmp/istio-{{ istio_version }}-linux-amd64.tar.gz"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # 1. Download istioctl
+    # -------------------------------------------------------------------------
+    - name: "istioctl | Check if istioctl already installed at correct version"
+      ansible.builtin.command:
+        cmd: "{{ istioctl_path }} version --short --remote=false"
+      register: _istioctl_ver
+      failed_when: false
+      changed_when: false
+
+    - name: "istioctl | Download Istio release tarball"
+      ansible.builtin.get_url:
+        url: "{{ istio_download_url }}"
+        dest: "{{ _istioctl_tmp }}"
+        mode: "0644"
+        checksum: "sha256:https://github.com/istio/istio/releases/download/{{ istio_version }}/istio-{{ istio_version }}-linux-amd64.tar.gz.sha256"
+      when: >-
+        _istioctl_ver.rc != 0 or
+        istio_version not in (_istioctl_ver.stdout | default(''))
+
+    - name: "istioctl | Create installation directory"
+      ansible.builtin.file:
+        path: "{{ istio_install_dir }}"
+        state: directory
+        mode: "0755"
+      when: >-
+        _istioctl_ver.rc != 0 or
+        istio_version not in (_istioctl_ver.stdout | default(''))
+
+    - name: "istioctl | Extract istioctl binary"
+      ansible.builtin.unarchive:
+        src: "{{ _istioctl_tmp }}"
+        dest: "{{ istio_install_dir }}"
+        extra_opts:
+          - "--strip-components=1"
+        creates: "{{ istioctl_path }}"
+
+    - name: "istioctl | Ensure istioctl is executable"
+      ansible.builtin.file:
+        path: "{{ istioctl_path }}"
+        mode: "0755"
+
+    - name: "istioctl | Confirm version"
+      ansible.builtin.command:
+        cmd: "{{ istioctl_path }} version --short --remote=false"
+      register: _istioctl_ver_confirm
+      changed_when: false
+
+    - name: "istioctl | Display installed version"
+      ansible.builtin.debug:
+        msg: "istioctl version: {{ _istioctl_ver_confirm.stdout }}"
+
+    # -------------------------------------------------------------------------
+    # 2. Update kubeconfigs
+    # -------------------------------------------------------------------------
+    - name: "kubeconfig | Update kubeconfig for eks-test-1"
+      ansible.builtin.command:
+        cmd: >-
+          aws eks update-kubeconfig
+          --region {{ aws_region }}
+          --name eks-test-1
+          --alias eks-test-1
+      changed_when: false
+
+    - name: "kubeconfig | Update kubeconfig for eks-test-2"
+      ansible.builtin.command:
+        cmd: >-
+          aws eks update-kubeconfig
+          --region {{ aws_region }}
+          --name eks-test-2
+          --alias eks-test-2
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # 3. Write IstioOperator manifests
+    # -------------------------------------------------------------------------
+    - name: "IstioOperator | Write IstioOperator for eks-test-1"
+      ansible.builtin.copy:
+        dest: /tmp/istio-operator-eks-test-1.yaml
+        mode: "0644"
+        content: |
+          apiVersion: install.istio.io/v1alpha1
+          kind: IstioOperator
+          metadata:
+            name: study-mesh-eks-test-1
+            namespace: istio-system
+          spec:
+            profile: default
+            values:
+              global:
+                meshID: {{ istio_mesh_id }}
+                multiCluster:
+                  clusterName: eks-test-1
+                network: network-test-1
+                # Use the plugin CA from cacerts secret
+                caAddress: istiod.istio-system.svc:15012
+              pilot:
+                env:
+                  PILOT_ENABLE_WORKLOAD_ENTRY_AUTOREGISTRATION: "true"
+                  PILOT_ENABLE_CROSS_CLUSTER_WORKLOAD_ENTRY: "true"
+            components:
+              pilot:
+                k8s:
+                  replicaCount: 2
+                  resources:
+                    requests:
+                      cpu: 500m
+                      memory: 2Gi
+                    limits:
+                      cpu: "2"
+                      memory: 4Gi
+                  hpaSpec:
+                    minReplicas: 2
+                    maxReplicas: 5
+                  affinity:
+                    podAntiAffinity:
+                      requiredDuringSchedulingIgnoredDuringExecution:
+                        - labelSelector:
+                            matchLabels:
+                              app: istiod
+                          topologyKey: kubernetes.io/hostname
+              ingressGateways:
+                - name: istio-ingressgateway
+                  enabled: true
+                  k8s:
+                    replicaCount: 2
+                    serviceAnnotations:
+                      service.beta.kubernetes.io/aws-load-balancer-type: external
+                      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 128Mi
+                      limits:
+                        cpu: "2"
+                        memory: 1Gi
+            meshConfig:
+              defaultConfig:
+                proxyMetadata:
+                  ISTIO_META_DNS_CAPTURE: "true"
+                  ISTIO_META_DNS_AUTO_ALLOCATE: "true"
+              accessLogFile: /dev/stdout
+              enableTracing: true
+              defaultProviders:
+                tracing:
+                  - name: zipkin
+
+    - name: "IstioOperator | Write IstioOperator for eks-test-2"
+      ansible.builtin.copy:
+        dest: /tmp/istio-operator-eks-test-2.yaml
+        mode: "0644"
+        content: |
+          apiVersion: install.istio.io/v1alpha1
+          kind: IstioOperator
+          metadata:
+            name: study-mesh-eks-test-2
+            namespace: istio-system
+          spec:
+            profile: default
+            values:
+              global:
+                meshID: {{ istio_mesh_id }}
+                multiCluster:
+                  clusterName: eks-test-2
+                network: network-test-2
+                caAddress: istiod.istio-system.svc:15012
+              pilot:
+                env:
+                  PILOT_ENABLE_WORKLOAD_ENTRY_AUTOREGISTRATION: "true"
+                  PILOT_ENABLE_CROSS_CLUSTER_WORKLOAD_ENTRY: "true"
+            components:
+              pilot:
+                k8s:
+                  replicaCount: 2
+                  resources:
+                    requests:
+                      cpu: 500m
+                      memory: 2Gi
+                    limits:
+                      cpu: "2"
+                      memory: 4Gi
+                  hpaSpec:
+                    minReplicas: 2
+                    maxReplicas: 5
+                  affinity:
+                    podAntiAffinity:
+                      requiredDuringSchedulingIgnoredDuringExecution:
+                        - labelSelector:
+                            matchLabels:
+                              app: istiod
+                          topologyKey: kubernetes.io/hostname
+              ingressGateways:
+                - name: istio-ingressgateway
+                  enabled: true
+                  k8s:
+                    replicaCount: 2
+                    serviceAnnotations:
+                      service.beta.kubernetes.io/aws-load-balancer-type: external
+                      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 128Mi
+                      limits:
+                        cpu: "2"
+                        memory: 1Gi
+            meshConfig:
+              defaultConfig:
+                proxyMetadata:
+                  ISTIO_META_DNS_CAPTURE: "true"
+                  ISTIO_META_DNS_AUTO_ALLOCATE: "true"
+              accessLogFile: /dev/stdout
+              enableTracing: true
+              defaultProviders:
+                tracing:
+                  - name: zipkin
+
+    # -------------------------------------------------------------------------
+    # 4. Install Istio on eks-test-1
+    # -------------------------------------------------------------------------
+    - name: "eks-test-1 | Verify cacerts secret exists before install"
+      kubernetes.core.k8s_info:
+        context: eks-test-1
+        api_version: v1
+        kind: Secret
+        name: cacerts
+        namespace: istio-system
+      register: _t1_cacerts
+      failed_when: _t1_cacerts.resources | length == 0
+
+    - name: "eks-test-1 | Run istioctl install"
+      ansible.builtin.command:
+        cmd: >-
+          {{ istioctl_path }} install
+          --context eks-test-1
+          -f /tmp/istio-operator-eks-test-1.yaml
+          --verify
+          --skip-confirmation
+      register: _t1_install
+      changed_when: "'No changes' not in _t1_install.stdout"
+
+    - name: "eks-test-1 | Wait for istiod Deployment to be ready"
+      kubernetes.core.k8s_info:
+        context: eks-test-1
+        api_version: apps/v1
+        kind: Deployment
+        name: istiod
+        namespace: istio-system
+      register: _t1_istiod
+      until: >-
+        _t1_istiod.resources | length > 0 and
+        (_t1_istiod.resources[0].status.readyReplicas | default(0)) ==
+        (_t1_istiod.resources[0].spec.replicas | default(1))
+      retries: 30
+      delay: 20
+
+    - name: "eks-test-1 | Label study-platform namespace for sidecar injection"
+      kubernetes.core.k8s:
+        context: eks-test-1
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ study_platform_namespace }}"
+            labels:
+              istio-injection: enabled
+              topology.istio.io/network: network-test-1
+              environment: staging
+              app.kubernetes.io/managed-by: ansible
+
+    - name: "eks-test-1 | Apply default PeerAuthentication (STRICT mTLS)"
+      kubernetes.core.k8s:
+        context: eks-test-1
+        state: present
+        definition:
+          apiVersion: security.istio.io/v1beta1
+          kind: PeerAuthentication
+          metadata:
+            name: default
+            namespace: istio-system
+          spec:
+            mtls:
+              mode: STRICT
+
+    # -------------------------------------------------------------------------
+    # 5. Install Istio on eks-test-2
+    # -------------------------------------------------------------------------
+    - name: "eks-test-2 | Verify cacerts secret exists before install"
+      kubernetes.core.k8s_info:
+        context: eks-test-2
+        api_version: v1
+        kind: Secret
+        name: cacerts
+        namespace: istio-system
+      register: _t2_cacerts
+      failed_when: _t2_cacerts.resources | length == 0
+
+    - name: "eks-test-2 | Run istioctl install"
+      ansible.builtin.command:
+        cmd: >-
+          {{ istioctl_path }} install
+          --context eks-test-2
+          -f /tmp/istio-operator-eks-test-2.yaml
+          --verify
+          --skip-confirmation
+      register: _t2_install
+      changed_when: "'No changes' not in _t2_install.stdout"
+
+    - name: "eks-test-2 | Wait for istiod Deployment to be ready"
+      kubernetes.core.k8s_info:
+        context: eks-test-2
+        api_version: apps/v1
+        kind: Deployment
+        name: istiod
+        namespace: istio-system
+      register: _t2_istiod
+      until: >-
+        _t2_istiod.resources | length > 0 and
+        (_t2_istiod.resources[0].status.readyReplicas | default(0)) ==
+        (_t2_istiod.resources[0].spec.replicas | default(1))
+      retries: 30
+      delay: 20
+
+    - name: "eks-test-2 | Label study-platform namespace for sidecar injection"
+      kubernetes.core.k8s:
+        context: eks-test-2
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ study_platform_namespace }}"
+            labels:
+              istio-injection: enabled
+              topology.istio.io/network: network-test-2
+              environment: production
+              app.kubernetes.io/managed-by: ansible
+
+    - name: "eks-test-2 | Apply default PeerAuthentication (STRICT mTLS)"
+      kubernetes.core.k8s:
+        context: eks-test-2
+        state: present
+        definition:
+          apiVersion: security.istio.io/v1beta1
+          kind: PeerAuthentication
+          metadata:
+            name: default
+            namespace: istio-system
+          spec:
+            mtls:
+              mode: STRICT
+
+    # -------------------------------------------------------------------------
+    # 6. Summary
+    # -------------------------------------------------------------------------
+    - name: "Summary | Print Istio installation result"
+      ansible.builtin.debug:
+        msg:
+          - "Istio {{ istio_version }} installed successfully on both spoke clusters."
+          - "eks-test-1 istiod ready replicas: {{ _t1_istiod.resources[0].status.readyReplicas }}"
+          - "eks-test-2 istiod ready replicas: {{ _t2_istiod.resources[0].status.readyReplicas }}"
+          - "mTLS mode: STRICT on both clusters."
+          - "Next: run 03-east-west-gateway.yaml"

@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rundeck
+  namespace: rundeck
+  labels:
+    app: rundeck
+    app.kubernetes.io/name: rundeck
+    app.kubernetes.io/component: deployment-scheduler
+    app.kubernetes.io/part-of: study-platform-ops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rundeck
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: rundeck
+        app.kubernetes.io/name: rundeck
+    spec:
+      serviceAccountName: rundeck
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsNonRoot: true
+      containers:
+        - name: rundeck
+          image: rundeck/rundeck:5.8.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 4440
+              protocol: TCP
+          env:
+            - name: RUNDECK_GRAILS_URL
+              value: "http://rundeck.eks-ops.internal"
+            - name: RUNDECK_DATABASE_DRIVER
+              value: "org.postgresql.Driver"
+            - name: RUNDECK_DATABASE_URL
+              value: "jdbc:postgresql://postgres:5432/rundeck"
+            - name: RUNDECK_DATABASE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: rundeck-postgres-secret
+                  key: username
+            - name: RUNDECK_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rundeck-postgres-secret
+                  key: password
+            - name: RUNDECK_SERVER_ADDRESS
+              value: "0.0.0.0"
+            - name: RUNDECK_SERVER_CONTEXTPATH
+              value: "/"
+            - name: RUNDECK_LOGGING_STRATEGY
+              value: "FILE"
+            - name: RUNDECK_FEATURE_REPOSITORY_ENABLED
+              value: "true"
+            - name: JVM_MAX_RAM_PERCENTAGE
+              value: "75"
+            # Slack global notification webhook — referenced by job definitions
+            - name: RUNDECK_PLUGIN_SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rundeck-slack-secret
+                  key: webhook-url
+            # ArgoCD auth token for job steps
+            - name: ARGOCD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: rundeck-argocd-secret
+                  key: auth-token
+          volumeMounts:
+            - name: config
+              mountPath: /home/rundeck/server/config
+            - name: logs
+              mountPath: /home/rundeck/var/logs
+            - name: kubeconfigs
+              mountPath: /opt/kubeconfig
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /api/14/system/info
+              port: 4440
+              scheme: HTTP
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/14/system/info
+              port: 4440
+              scheme: HTTP
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 10
+            successThreshold: 1
+            failureThreshold: 5
+      volumes:
+        - name: config
+          configMap:
+            name: rundeck-config
+        - name: logs
+          persistentVolumeClaim:
+            claimName: rundeck-logs-pvc
+        - name: kubeconfigs
+          secret:
+            secretName: rundeck-kubeconfigs
+      tolerations:
+        - key: "node-role.kubernetes.io/ops"
+          operator: "Exists"
+          effect: "NoSchedule"

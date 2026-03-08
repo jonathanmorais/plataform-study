@@ -1,0 +1,76 @@
+# East-West Gateway — Cross-Cluster Service Discovery and Routing
+#
+# This Gateway exposes services from each cluster to the other cluster's
+# Istio control plane over the East-West gateway LoadBalancer.
+#
+# In a multi-primary Istio topology (eks-test-1 and eks-test-2 each run
+# their own istiod), cross-cluster service discovery works as follows:
+#
+#   1. Both clusters exchange remote secrets via:
+#        istioctl create-remote-secret --name=eks-test-2 --context=eks-test-2 \
+#          | kubectl apply -f - --context=eks-test-1
+#        (and vice versa)
+#
+#   2. Each istiod connects to the other cluster's API server and discovers
+#      services and endpoints.
+#
+#   3. Cross-cluster traffic is sent to the target cluster's East-West
+#      Gateway LoadBalancer IP on port 15443 (TLS passthrough).
+#
+#   4. The East-West Gateway on the target cluster receives the connection,
+#      reads the SNI header (which encodes the target service FQDN), and
+#      forwards the connection to the correct local pod.
+#
+# Port 15443: mTLS passthrough — actual workload traffic
+# Port 15021: Istio health check / status port (used by istiod probes)
+#
+# The east-west gateway Deployment itself is installed by:
+#   istioctl install --set values.gateways.istio-egressgateway.enabled=false \
+#     --set components.ingressGateways[0].name=istio-eastwestgateway \
+#     --set components.ingressGateways[0].label.istio=eastwestgateway \
+#     --set components.ingressGateways[0].k8s.service.type=LoadBalancer
+# (handled in Ansible playbook 03-east-west-gateway.yaml)
+#
+# Apply:
+#   kubectl apply -f istio/east-west-gateway.yaml --context eks-test-1
+#   kubectl apply -f istio/east-west-gateway.yaml --context eks-test-2
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: cross-network-gateway
+  namespace: istio-system
+  labels:
+    app.kubernetes.io/part-of: study-platform
+    app.kubernetes.io/component: east-west-gateway
+    app.kubernetes.io/managed-by: argocd
+spec:
+  selector:
+    # Matches the east-west gateway Deployment pods.
+    # This label is set during istioctl install (see above).
+    istio: eastwestgateway
+  servers:
+    # Port 15443 — mTLS passthrough for cross-cluster service traffic.
+    # SNI-based routing: Envoy reads the SNI field of the TLS ClientHello
+    # to determine the target service, then forwards to the local pod.
+    # No cert termination occurs here — mTLS is end-to-end between workloads.
+    - port:
+        number: 15443
+        name: tls-passthrough
+        protocol: TLS
+      tls:
+        mode: AUTO_PASSTHROUGH
+      hosts:
+        # Wildcard matches all services across all namespaces.
+        # Istio restricts actual routing to services discovered via
+        # remote secrets — this is not an open relay.
+        - "*.local"
+
+    # Port 15021 — Istio status/health port.
+    # Used by istiod on the remote cluster to verify gateway liveness
+    # and by external health checks (e.g., AWS NLB target group health).
+    - port:
+        number: 15021
+        name: status-port
+        protocol: HTTP
+      hosts:
+        - "*"

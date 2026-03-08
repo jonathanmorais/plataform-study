@@ -1,0 +1,264 @@
+# Rundeck Job Definition — Rollback Production
+# Stored in: rundeck/jobs/rollback.yaml
+#
+# Purpose:
+#   Manually trigger an ArgoCD rollback for a chosen cluster.
+#   Can be run as "Run Now" at any time by on-call engineers.
+#   Provides a UI-driven rollback with audit trail, reason logging, and
+#   Slack notification — preferable to raw kubectl/argocd CLI in incidents
+#   because every execution is logged with who ran it, why, and when.
+#
+# This job does NOT patch the VirtualService — it assumes the ArgoCD rollback
+# will revert to a known-good image. If traffic weighting is also incorrect,
+# the engineer should separately edit istio/virtual-service.yaml and push to Git.
+
+- id: rollback
+  name: "Rollback Production"
+  description: >
+    Rolls back the study-platform application on the selected cluster
+    to its previous ArgoCD revision. Records reason in the audit trail
+    and notifies #deployments on Slack.
+  group: "deployments"
+  loglevel: INFO
+  timeout: "10m"
+
+  # No schedule — always triggered via "Run Now"
+  schedule:
+    enabled: false
+
+  options:
+    - name: cluster
+      label: "Target Cluster"
+      description: >
+        The cluster to roll back.
+        eks-test-1 = staging | eks-test-2 = prod
+      required: true
+      type: Select
+      values:
+        - "eks-test-1"
+        - "eks-test-2"
+      default: "eks-test-2"
+
+    - name: reason
+      label: "Rollback Reason"
+      description: >
+        Mandatory explanation for the rollback. Appears in the audit trail
+        and Slack notification.
+        Example: "High 5xx error rate after v1.5.0 deploy — reverting to v1.4.9"
+      required: true
+      multivalued: false
+
+  steps:
+    # -------------------------------------------------------------------------
+    # Step 1 — Log rollback intent
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Log rollback intent"
+      configuration:
+        exec: |
+          echo "========================================"
+          echo "  ROLLBACK INITIATED"
+          echo "========================================"
+          echo "  Cluster     : ${option.cluster}"
+          echo "  Reason      : ${option.reason}"
+          echo "  Triggered by: ${job.username}"
+          echo "  Job ID      : ${job.execid}"
+          echo "  Timestamp   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "========================================"
+
+    # -------------------------------------------------------------------------
+    # Step 2 — Restore VirtualService to 100% v1 (safe traffic state)
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Restore VirtualService to 100% stable (v1)"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          # Map Rundeck cluster option to kubectl context name
+          CLUSTER="${option.cluster}"
+
+          echo "Restoring Istio VirtualService to 100% v1 on ${CLUSTER}..."
+
+          kubectl patch virtualservice study-platform \
+            -n study-platform \
+            --context "${CLUSTER}" \
+            --type merge \
+            -p '{
+              "spec": {
+                "http": [
+                  {
+                    "name": "rollback-stable",
+                    "route": [
+                      {
+                        "destination": {
+                          "host": "study-platform",
+                          "subset": "v1"
+                        },
+                        "weight": 100
+                      }
+                    ],
+                    "timeout": "30s",
+                    "retries": {
+                      "attempts": 3,
+                      "perTryTimeout": "10s",
+                      "retryOn": "gateway-error,connect-failure,retriable-4xx"
+                    }
+                  }
+                ]
+              }
+            }'
+
+          echo "VirtualService updated: 100% traffic on v1 (stable)."
+
+    # -------------------------------------------------------------------------
+    # Step 3 — Determine ArgoCD app name from cluster option
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Derive ArgoCD app name and trigger rollback"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          CLUSTER="${option.cluster}"
+
+          # Map cluster name to ArgoCD application name
+          case "${CLUSTER}" in
+            eks-test-1)
+              ARGOCD_APP="study-platform-test-1"
+              ;;
+            eks-test-2)
+              ARGOCD_APP="study-platform-test-2"
+              ;;
+            *)
+              echo "ERROR: Unknown cluster '${CLUSTER}'. Must be eks-test-1 or eks-test-2."
+              exit 1
+              ;;
+          esac
+
+          echo "Target ArgoCD application: ${ARGOCD_APP}"
+          echo "Initiating ArgoCD rollback..."
+
+          argocd app rollback "${ARGOCD_APP}" \
+            --auth-token "${ARGOCD_TOKEN}" \
+            --server argocd.eks-ops.internal \
+            --grpc-web
+
+          echo "Waiting for rollback to complete..."
+          argocd app wait "${ARGOCD_APP}" \
+            --auth-token "${ARGOCD_TOKEN}" \
+            --server argocd.eks-ops.internal \
+            --grpc-web \
+            --sync \
+            --health \
+            --timeout 120
+
+          echo "ArgoCD rollback complete for ${ARGOCD_APP}."
+
+    # -------------------------------------------------------------------------
+    # Step 4 — Verify rollback health
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Verify application health post-rollback"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          CLUSTER="${option.cluster}"
+
+          echo "Verifying pod health on ${CLUSTER}..."
+
+          kubectl rollout status deployment/study-platform \
+            -n study-platform \
+            --context "${CLUSTER}" \
+            --timeout=120s
+
+          READY_PODS=$(kubectl get pods \
+            -n study-platform \
+            --context "${CLUSTER}" \
+            -l app=study-platform \
+            --field-selector=status.phase=Running \
+            --no-headers 2>/dev/null | wc -l)
+
+          echo "Running pods after rollback: ${READY_PODS}"
+
+          if [ "${READY_PODS}" -lt 1 ]; then
+            echo "ERROR: No running pods detected after rollback. Manual intervention required."
+            exit 1
+          fi
+
+          echo "Rollback verified — ${READY_PODS} pod(s) running on ${CLUSTER}."
+
+    # -------------------------------------------------------------------------
+    # Step 5 — Log rollback complete
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Rollback complete"
+      configuration:
+        exec: |
+          echo "========================================"
+          echo "  ROLLBACK COMPLETE"
+          echo "========================================"
+          echo "  Cluster     : ${option.cluster}"
+          echo "  Reason      : ${option.reason}"
+          echo "  Executed by : ${job.username}"
+          echo "  Completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "========================================"
+          echo "Next steps:"
+          echo "  1. Monitor error rate in Grafana for 10 minutes"
+          echo "  2. Verify VirtualService state with: kubectl get vs study-platform -n study-platform"
+          echo "  3. Open incident / post-mortem ticket if not already done"
+          echo "  4. Investigate root cause before re-deploying"
+
+  # ---------------------------------------------------------------------------
+  # Error handlers — notify on rollback job failure (manual action required)
+  # ---------------------------------------------------------------------------
+  errorhandlers:
+    - type: command
+      description: "Alert on rollback failure"
+      configuration:
+        exec: |
+          echo "========================================"
+          echo "  ROLLBACK JOB FAILED"
+          echo "========================================"
+          echo "  Cluster     : ${option.cluster}"
+          echo "  Reason      : ${option.reason}"
+          echo "  Failed step : ${job.stepnum}"
+          echo "  Timestamp   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo ""
+          echo "MANUAL INTERVENTION REQUIRED."
+          echo "Check ArgoCD UI and kubectl for cluster state."
+
+  # ---------------------------------------------------------------------------
+  # Notifications
+  # ---------------------------------------------------------------------------
+  notification:
+    onsuccess:
+      plugin:
+        type: slack-incoming-webhook
+        configuration:
+          webhook_url: "${globals.slack_webhook}"
+          message: |
+            *ROLLBACK EXECUTED* :rewind: :white_check_mark:
+            *Cluster:* ${option.cluster}
+            *Reason:* ${option.reason}
+            *Executed by:* ${job.username}
+            *Completed at:* now
+            ArgoCD has rolled back to the previous healthy revision. Monitor Grafana for 10 minutes.
+            *Rundeck job:* <${globals.rundeck_url}/project/deployments/execution/show/${job.execid}|View execution>
+          channel: "#deployments"
+
+    onfailure:
+      plugin:
+        type: slack-incoming-webhook
+        configuration:
+          webhook_url: "${globals.slack_webhook}"
+          message: |
+            *ROLLBACK FAILED* :rewind: :x:
+            *Cluster:* ${option.cluster}
+            *Reason:* ${option.reason}
+            *Triggered by:* ${job.username}
+            *Failed at step:* ${job.stepnum}
+            *MANUAL INTERVENTION REQUIRED.* Check ArgoCD and kubectl immediately.
+            *Rundeck job:* <${globals.rundeck_url}/project/deployments/execution/show/${job.execid}|View execution>
+          channel: "#deployments"

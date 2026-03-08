@@ -1,0 +1,215 @@
+name: Infrastructure Plan & Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      triggered_by:
+        description: "What triggered this workflow"
+        required: false
+        default: "manual"
+        type: string
+      ami_id:
+        description: "AMI ID to use (leave blank to read from SSM)"
+        required: false
+        type: string
+      git_sha:
+        description: "Git SHA being deployed"
+        required: false
+        type: string
+  workflow_run:
+    workflows:
+      - "AMI Build"
+    types:
+      - completed
+
+permissions:
+  id-token: write
+  contents: read
+  actions: write
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.8.5"
+  GO_VERSION: "1.22"
+
+jobs:
+  resolve-ami:
+    name: Resolve AMI ID from SSM
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    outputs:
+      ami_id: ${{ steps.get-ami.outputs.ami_id }}
+      git_sha: ${{ steps.meta.outputs.git_sha }}
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: infra-plan-${{ github.run_id }}
+
+      - name: Resolve AMI ID
+        id: get-ami
+        run: |
+          if [[ -n "${{ inputs.ami_id }}" ]]; then
+            AMI_ID="${{ inputs.ami_id }}"
+            echo "Using AMI from workflow input: $AMI_ID"
+          else
+            AMI_ID=$(aws ssm get-parameter \
+              --name "/platform/ami/latest" \
+              --query "Parameter.Value" \
+              --output text)
+            echo "Using AMI from SSM: $AMI_ID"
+          fi
+          echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Set git SHA metadata
+        id: meta
+        run: |
+          SHA="${{ inputs.git_sha || github.sha }}"
+          echo "git_sha=$SHA" >> "$GITHUB_OUTPUT"
+
+  terraform-plan:
+    name: Terraform Plan — ${{ matrix.cluster }}
+    runs-on: ubuntu-latest
+    needs: resolve-ami
+    strategy:
+      fail-fast: false
+      matrix:
+        cluster:
+          - eks-ops
+          - eks-test-1
+          - eks-test-2
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: tf-plan-${{ matrix.cluster }}-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init — ${{ matrix.cluster }}
+        working-directory: infra/terraform/clusters/${{ matrix.cluster }}
+        run: |
+          terraform init \
+            -backend-config="key=${{ matrix.cluster }}/terraform.tfstate" \
+            -reconfigure
+
+      - name: Terraform Validate — ${{ matrix.cluster }}
+        working-directory: infra/terraform/clusters/${{ matrix.cluster }}
+        run: terraform validate
+
+      - name: Terraform Plan — ${{ matrix.cluster }}
+        working-directory: infra/terraform/clusters/${{ matrix.cluster }}
+        run: |
+          terraform plan \
+            -var="ami_id=${{ needs.resolve-ami.outputs.ami_id }}" \
+            -var="git_sha=${{ needs.resolve-ami.outputs.git_sha }}" \
+            -out=tfplan \
+            -detailed-exitcode
+        env:
+          TF_VAR_cluster_name: ${{ matrix.cluster }}
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.cluster }}
+          path: infra/terraform/clusters/${{ matrix.cluster }}/tfplan
+          retention-days: 5
+
+  terratest:
+    name: Terratest
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: terratest-${{ github.run_id }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: infra/terraform/test/go.sum
+
+      - name: Setup Terraform (for Terratest)
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Run Terratest
+        working-directory: infra/terraform/test
+        run: |
+          go test -v -timeout 30m ./...
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+
+  trigger-apply-staging:
+    name: Trigger Apply — Staging
+    runs-on: ubuntu-latest
+    needs: terratest
+    if: >
+      startsWith(github.ref, 'refs/heads/feature/') ||
+      github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Trigger infra-apply for staging
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'infra-apply.yaml',
+              ref: context.ref,
+              inputs: {
+                clusters: 'eks-test-1',
+                environment: 'staging',
+              }
+            });
+            core.info('Triggered infra-apply.yaml for staging');
+
+  trigger-apply-prod:
+    name: Trigger Apply — Production
+    runs-on: ubuntu-latest
+    needs: trigger-apply-staging
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Trigger infra-apply for production
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'infra-apply.yaml',
+              ref: context.ref,
+              inputs: {
+                clusters: 'eks-ops eks-test-2',
+                environment: 'production',
+              }
+            });
+            core.info('Triggered infra-apply.yaml for production');

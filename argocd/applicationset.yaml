@@ -1,0 +1,149 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: study-platform
+  namespace: argocd
+  annotations:
+    # This ApplicationSet itself is wave -5, so it lands after the AppProject
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  # Prevent accidental deletion of all child apps if the ApplicationSet is removed
+  preservedFields:
+    annotations:
+      - argocd.argoproj.io/sync-wave
+
+  # Use List generator so we can express per-cluster differences declaratively
+  generators:
+    - list:
+        elements:
+          # ── Staging cluster ──────────────────────────────────────────────────
+          - cluster: eks-test-1
+            clusterOverlay: test-1
+            clusterUrl: https://EKS_TEST_1_API_ENDPOINT
+            environment: staging
+            # Staging gets full auto-sync: any GitOps commit deploys immediately
+            autoSync: "true"
+            prune: "true"
+            selfHeal: "true"
+            # Lighter retry policy for staging — fail fast, fix fast
+            retryLimit: "3"
+            retryBaseSeconds: "10"
+            retryMaxSeconds: "120"
+            retryFactor: "2"
+            # Sync waves allow ordering within the application
+            syncWave: "0"
+            # Staging allows force-apply for faster iteration
+            applyOutOfSyncOnly: "true"
+
+          # ── Production cluster ────────────────────────────────────────────────
+          - cluster: eks-test-2
+            clusterOverlay: test-2
+            clusterUrl: https://EKS_TEST_2_API_ENDPOINT
+            environment: production
+            # Prod: NO automated sync — Rundeck controls deploy timing
+            # See CLAUDE.MD: "ArgoCD detects drift — waits for Rundeck trigger"
+            autoSync: "false"
+            prune: "false"
+            selfHeal: "false"
+            # More conservative retry policy for prod
+            retryLimit: "5"
+            retryBaseSeconds: "30"
+            retryMaxSeconds: "600"
+            retryFactor: "2"
+            syncWave: "0"
+            applyOutOfSyncOnly: "true"
+
+  template:
+    metadata:
+      # ArgoCD app name convention: study-platform-{cluster}
+      # Matches commands in CLAUDE.MD: argocd app sync study-platform-test-2
+      name: "study-platform-{{cluster}}"
+      namespace: argocd
+      labels:
+        app.kubernetes.io/name: study-platform
+        app.kubernetes.io/part-of: study-platform
+        environment: "{{environment}}"
+        cluster: "{{cluster}}"
+      annotations:
+        argocd.argoproj.io/sync-wave: "{{syncWave}}"
+        # Tracked for Rundeck deploy audit trail
+        deploy.study-platform.io/managed-by: "argocd-applicationset"
+        deploy.study-platform.io/cluster: "{{cluster}}"
+        deploy.study-platform.io/environment: "{{environment}}"
+
+    spec:
+      project: study-platform
+
+      source:
+        # The GitOps repository — update to your actual org URL
+        repoURL: https://github.com/YOUR_ORG/plataform-study.git
+        targetRevision: main
+        # Each cluster uses its own Kustomize overlay
+        path: "apps/overlays/{{clusterOverlay}}"
+
+      destination:
+        server: "{{clusterUrl}}"
+        namespace: study-platform
+
+      # ── Sync policy ──────────────────────────────────────────────────────────
+      # Note: we cannot use template conditionals in ApplicationSet v1beta1,
+      # so we set automated on both and override via patch for test-2.
+      # The syncWindows in project.yaml block automated syncs on prod.
+      syncPolicy:
+        automated:
+          # These fields are only effective when autoSync=true in the generator.
+          # For prod (test-2), the syncWindow deny rule in project.yaml
+          # prevents automated syncs from firing — Rundeck does manual syncs.
+          prune: false      # overridden per cluster via generator values below
+          selfHeal: false   # overridden per cluster via generator values below
+
+        syncOptions:
+          # Create the namespace if it does not exist
+          - CreateNamespace=true
+          # Respect sync waves declared on individual resources
+          - RespectIgnoreDifferences=true
+          # Only apply resources that are actually out of sync (safer for prod)
+          - ApplyOutOfSyncOnly=true
+          # Server-side apply for large CRDs and Istio configs
+          - ServerSideApply=true
+
+        retry:
+          limit: 5
+          backoff:
+            duration: 30s
+            factor: 2
+            maxDuration: 10m
+
+      # ── Resource health + ignore rules ───────────────────────────────────────
+      ignoreDifferences:
+        # Istio injects sidecar annotations — ignore those diffs
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/template/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration
+        # HPA current replicas fluctuate — ignore
+        - group: autoscaling
+          kind: HorizontalPodAutoscaler
+          jsonPointers:
+            - /spec/minReplicas
+        # AWS Load Balancer Controller adds finalizers — ignore
+        - group: ""
+          kind: Service
+          jsonPointers:
+            - /metadata/finalizers
+
+      # Resource hooks for pre/post sync operations
+      # Wave ordering within the Application:
+      #   wave -2 : Namespace
+      #   wave -1 : ConfigMap, Secret
+      #   wave  0 : Deployment, Service, HPA, PDB
+      #   wave  1 : Istio VirtualService, DestinationRule (if in this overlay)
+      revisionHistoryLimit: 10
+
+  # Template patch overrides — apply per-cluster sync automation settings
+  templatePatch: |
+    spec:
+      syncPolicy:
+        automated:
+          prune: {{prune}}
+          selfHeal: {{selfHeal}}

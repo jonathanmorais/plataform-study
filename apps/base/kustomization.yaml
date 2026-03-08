@@ -1,0 +1,26 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ── Base resources ─────────────────────────────────────────────────────────────
+# Overlays (apps/overlays/test-1 and test-2) reference this base via:
+#   resources:
+#     - ../../base
+resources:
+  - deployment.yaml
+  - service.yaml
+  - configmap.yaml
+  - hpa.yaml
+  - poddisruptionbudget.yaml
+
+# ── Common labels applied to ALL resources in this base ───────────────────────
+# Overlays can add more labels; these are the immutable base identity labels.
+commonLabels:
+  app.kubernetes.io/name: study-platform
+  app.kubernetes.io/part-of: study-platform
+  app.kubernetes.io/managed-by: argocd
+
+# ── Namespace ─────────────────────────────────────────────────────────────────
+# Overlays declare their own namespace.yaml to set Istio injection labels.
+# Setting namespace here ensures all base resources default to study-platform
+# even if an overlay forgets to declare it.
+namespace: study-platform

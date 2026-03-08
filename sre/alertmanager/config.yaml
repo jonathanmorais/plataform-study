@@ -1,0 +1,292 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-study-platform
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kube-prometheus-stack
+    team: sre
+type: Opaque
+stringData:
+  alertmanager.yaml: |
+    # ---------------------------------------------------------------------------
+    # AlertManager configuration for study-platform
+    # Routes: P1 → #sre-alerts (paged), P2 → #platform-alerts, P3 → #platform-info
+    # Inhibition: P1 suppresses P2/P3 for the same cluster to reduce noise.
+    # ---------------------------------------------------------------------------
+
+    global:
+      # Slack API URL — injected from Kubernetes secret at runtime.
+      # The secret study-platform/alertmanager-slack-secret holds SLACK_API_URL.
+      slack_api_url: "${SLACK_API_URL}"
+
+      # How long to wait before resending a resolved notification
+      resolve_timeout: 5m
+
+      # SMTP config (unused — Slack-only routing for this platform)
+      # smtp_smarthost: ...
+
+    # ---------------------------------------------------------------------------
+    # Templates — custom Slack message formatting
+    # ---------------------------------------------------------------------------
+    templates:
+      - /etc/alertmanager/templates/*.tmpl
+
+    # ---------------------------------------------------------------------------
+    # Route tree
+    # All alerts enter at the root route and are matched top-to-bottom.
+    # First match wins. continue: true allows multiple receivers.
+    # ---------------------------------------------------------------------------
+    route:
+      # Default receiver for alerts that don't match any child route
+      receiver: slack-default
+
+      # Group alerts by these labels to batch notifications
+      group_by:
+        - cluster
+        - alertname
+        - severity
+        - namespace
+
+      # Wait for more alerts of the same group before firing (batching window)
+      group_wait: 30s
+
+      # How long to wait before sending a new notification for an existing group
+      group_interval: 5m
+
+      # How long to wait before resending a notification for the same alert
+      repeat_interval: 4h
+
+      routes:
+        # -------------------------------------------------------------------
+        # P1 — Critical alerts (page immediately, repeat every 30 minutes)
+        # Matched by severity label set on the PrometheusRule alert.
+        # -------------------------------------------------------------------
+        - matchers:
+            - severity = P1
+          receiver: slack-p1-critical
+          group_wait: 0s
+          group_interval: 1m
+          repeat_interval: 30m
+          continue: false
+
+        # -------------------------------------------------------------------
+        # P2 — Warning alerts (Slack channel, repeat every 2 hours)
+        # -------------------------------------------------------------------
+        - matchers:
+            - severity = P2
+          receiver: slack-p2-warning
+          group_wait: 30s
+          group_interval: 5m
+          repeat_interval: 2h
+          continue: false
+
+        # -------------------------------------------------------------------
+        # P3 — Informational alerts (low-priority channel, business hours)
+        # repeat_interval is 24h to avoid weekend noise
+        # -------------------------------------------------------------------
+        - matchers:
+            - severity = P3
+          receiver: slack-p3-info
+          group_wait: 2m
+          group_interval: 15m
+          repeat_interval: 24h
+          continue: false
+
+        # -------------------------------------------------------------------
+        # Watchdog — always-firing heartbeat alert from Prometheus.
+        # Route to a dead-man's-switch receiver (or silence it if using a
+        # dedicated uptime service like DeadMansSnitch/PagerDuty).
+        # -------------------------------------------------------------------
+        - matchers:
+            - alertname = Watchdog
+          receiver: watchdog
+          repeat_interval: 1m
+          continue: false
+
+    # ---------------------------------------------------------------------------
+    # Receivers
+    # ---------------------------------------------------------------------------
+    receivers:
+      # -------------------------------------------------------------------------
+      # Default — catches anything not matched above
+      # -------------------------------------------------------------------------
+      - name: slack-default
+        slack_configs:
+          - channel: "#platform-alerts"
+            send_resolved: true
+            color: 'gray'
+            title: |
+              [{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}
+            text: |
+              {{ range .Alerts }}
+              *Alert:* {{ .Labels.alertname }}
+              *Severity:* {{ .Labels.severity }}
+              *Cluster:* {{ .Labels.cluster | default "unknown" }}
+              *Summary:* {{ .Annotations.summary }}
+              *Description:* {{ .Annotations.description }}
+              {{ end }}
+
+      # -------------------------------------------------------------------------
+      # P1 Critical — mentions @channel, red color, runbook link
+      # Fires for: ErrorBudgetBurnRateCritical, IstiodDown, EastWestGatewayDown,
+      #            NodeDown, LatencyP95High, CertificateExpiringCritical
+      # -------------------------------------------------------------------------
+      - name: slack-p1-critical
+        slack_configs:
+          - channel: "#sre-alerts"
+            send_resolved: true
+            # Mention @channel to trigger mobile notifications for on-call
+            title: |
+              :red_circle: *P1 — {{ .CommonLabels.alertname }}* | Cluster: {{ .CommonLabels.cluster | default "unknown" }}
+            color: "danger"
+            pretext: "<!channel> *P1 Alert — Immediate action required*"
+            text: |
+              {{ range .Alerts }}
+              *Alert:* `{{ .Labels.alertname }}`
+              *Severity:* `{{ .Labels.severity }}`
+              *Cluster:* `{{ .Labels.cluster | default "unknown" }}`
+              *Namespace:* `{{ .Labels.namespace | default "N/A" }}`
+              *Component:* `{{ .Labels.component | default "N/A" }}`
+
+              *Summary:* {{ .Annotations.summary }}
+
+              *Description:*
+              {{ .Annotations.description }}
+
+              *Runbook:* <{{ .Annotations.runbook }}|Open Runbook>
+              *Dashboard:* <{{ .Annotations.dashboard }}|Open Dashboard>
+              *Started:* {{ .StartsAt | since | humanizeDuration }} ago
+              {{ end }}
+            actions:
+              - type: button
+                text: "View Runbook"
+                url: "{{ (index .Alerts 0).Annotations.runbook }}"
+                style: "danger"
+              - type: button
+                text: "Open Dashboard"
+                url: "{{ (index .Alerts 0).Annotations.dashboard }}"
+              - type: button
+                text: "Silence 1h"
+                url: "{{ .ExternalURL }}/#/silences/new?filter=%7Balertname%3D%22{{ (index .Alerts 0).Labels.alertname }}%22%7D"
+
+      # -------------------------------------------------------------------------
+      # P2 Warning — yellow, no @channel mention, links to runbook
+      # Fires for: ErrorBudgetBurnRateHigh, IstiodHighMemory, ArgoCDSyncFailed,
+      #            ArgoCDAppUnhealthy, CertificateExpiringSoon, MtlsFailureRateHigh
+      # -------------------------------------------------------------------------
+      - name: slack-p2-warning
+        slack_configs:
+          - channel: "#platform-alerts"
+            send_resolved: true
+            title: |
+              :warning: *P2 — {{ .CommonLabels.alertname }}* | Cluster: {{ .CommonLabels.cluster | default "unknown" }}
+            color: "warning"
+            text: |
+              {{ range .Alerts }}
+              *Alert:* `{{ .Labels.alertname }}`
+              *Severity:* `{{ .Labels.severity }}`
+              *Cluster:* `{{ .Labels.cluster | default "unknown" }}`
+              *Namespace:* `{{ .Labels.namespace | default "N/A" }}`
+              *Component:* `{{ .Labels.component | default "N/A" }}`
+
+              *Summary:* {{ .Annotations.summary }}
+
+              *Description:*
+              {{ .Annotations.description }}
+
+              *Runbook:* <{{ .Annotations.runbook }}|Open Runbook>
+              *Dashboard:* <{{ .Annotations.dashboard }}|Open Dashboard>
+              *Started:* {{ .StartsAt | since | humanizeDuration }} ago
+              {{ end }}
+            actions:
+              - type: button
+                text: "View Runbook"
+                url: "{{ (index .Alerts 0).Annotations.runbook }}"
+              - type: button
+                text: "Open Dashboard"
+                url: "{{ (index .Alerts 0).Annotations.dashboard }}"
+
+      # -------------------------------------------------------------------------
+      # P3 Informational — gray, no mentions, ticket for next business day
+      # Fires for: NodeCpuHigh, PvcUsageHigh, HpaAtMaxReplicas
+      # -------------------------------------------------------------------------
+      - name: slack-p3-info
+        slack_configs:
+          - channel: "#platform-info"
+            send_resolved: true
+            title: |
+              :large_blue_circle: *P3 — {{ .CommonLabels.alertname }}* | Cluster: {{ .CommonLabels.cluster | default "unknown" }}
+            color: "#808080"
+            text: |
+              {{ range .Alerts }}
+              *Alert:* `{{ .Labels.alertname }}`
+              *Severity:* `{{ .Labels.severity }}` — Investigate next business day
+              *Cluster:* `{{ .Labels.cluster | default "unknown" }}`
+              *Namespace:* `{{ .Labels.namespace | default "N/A" }}`
+
+              *Summary:* {{ .Annotations.summary }}
+              *Started:* {{ .StartsAt | since | humanizeDuration }} ago
+              {{ end }}
+
+      # -------------------------------------------------------------------------
+      # Watchdog — heartbeat receiver.
+      # In production this should be wired to a dead-man's snitch service.
+      # Currently just posts to a low-noise internal channel.
+      # -------------------------------------------------------------------------
+      - name: watchdog
+        slack_configs:
+          - channel: "#alertmanager-heartbeat"
+            send_resolved: false
+            title: "Watchdog heartbeat"
+            text: "Prometheus and AlertManager are operational."
+
+    # ---------------------------------------------------------------------------
+    # Inhibit Rules
+    # Suppress lower-severity alerts when a higher-severity alert is already firing
+    # for the same cluster. Prevents alert floods during major incidents.
+    # ---------------------------------------------------------------------------
+    inhibit_rules:
+      # P1 suppresses P2 for the same cluster + alertname family
+      - source_matchers:
+          - severity = P1
+        target_matchers:
+          - severity = P2
+        # Only inhibit if the alerts share the same cluster label
+        equal:
+          - cluster
+
+      # P1 suppresses P3 for the same cluster
+      - source_matchers:
+          - severity = P1
+        target_matchers:
+          - severity = P3
+        equal:
+          - cluster
+
+      # P2 suppresses P3 for the same cluster
+      - source_matchers:
+          - severity = P2
+        target_matchers:
+          - severity = P3
+        equal:
+          - cluster
+          - namespace
+
+      # NodeDown suppresses all workload/pod alerts on the same node
+      # (pods are expected to be disrupted when the node is gone)
+      - source_matchers:
+          - alertname = NodeDown
+        target_matchers:
+          - component = workloads
+        equal:
+          - node
+
+      # IstiodDown inhibits mTLS alerts (mTLS breaks when istiod is down — expected)
+      - source_matchers:
+          - alertname = IstiodDown
+        target_matchers:
+          - component = istio-mtls
+        equal:
+          - cluster

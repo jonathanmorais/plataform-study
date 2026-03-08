@@ -1,0 +1,388 @@
+# Rundeck Job Definition — Deploy Incident (Run Now)
+# Stored in: rundeck/jobs/incident-deploy.yaml
+#
+# Purpose:
+#   Emergency fast-track deployment. Triggered via "Run Now" in the Rundeck UI
+#   by engineers after manager approval in GitHub Environments (incident gate).
+#
+# Key differences from prod-deploy:
+#   - skip_canary is forced to true — no canary window, immediate full rollout
+#   - Syncs BOTH clusters: study-platform-test-1 (staging) AND study-platform-test-2 (prod)
+#   - Requires incident_id option for audit trail traceability
+#   - No sleep step
+#   - Slack message explicitly flags as INCIDENT deploy
+#
+# Pre-conditions:
+#   1. incidente/<n> branch has been merged to main via manager-approved PR
+#   2. GitHub Actions infra-apply.yaml has already applied Terraform to both clusters
+#   3. GitOps overlays for test-1 and test-2 have been updated with the new image tag
+#   4. Engineer triggers this job as "Run Now" (not scheduled)
+
+- id: incident-deploy
+  name: "Deploy Incident (Run Now)"
+  description: >
+    Emergency incident deployment to BOTH clusters simultaneously.
+    No canary — full immediate rollout. Requires incident_id for audit trail.
+    Use only after manager approval in GitHub. Triggered via "Run Now".
+  group: "deployments"
+  loglevel: INFO
+  timeout: "20m"
+
+  # No schedule — always triggered via "Run Now"
+  schedule:
+    enabled: false
+
+  options:
+    - name: incident_id
+      label: "Incident ID"
+      description: >
+        The incident identifier from your incident tracker.
+        Example: INC-0042
+        This is mandatory for audit trail and post-mortem traceability.
+      required: true
+      multivalued: false
+      regex: "^INC-[0-9]+$"
+
+    - name: description
+      label: "Deploy Description"
+      description: >
+        Brief explanation of the incident and what this deploy fixes.
+        Example: "Fix null pointer in payment service — checkout broken since 01:42 UTC"
+      required: true
+      multivalued: false
+
+    - name: version
+      label: "Version / Release Tag"
+      description: >
+        The semver tag or Git SHA to deploy. Must be available in ECR.
+        Example: v1.5.1
+      required: true
+      multivalued: false
+
+    # skip_canary is intentionally hidden from UI — always true for incidents.
+    # Exposed here as a fixed value for documentation purposes only.
+    - name: skip_canary
+      label: "Skip Canary"
+      description: "Always true for incident deploys. Do not change."
+      required: false
+      type: Select
+      values:
+        - "true"
+      default: "true"
+
+  steps:
+    # -------------------------------------------------------------------------
+    # Step 1 — Log incident deploy metadata
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Log incident deploy info"
+      configuration:
+        exec: |
+          echo "========================================"
+          echo "  INCIDENT DEPLOY STARTING"
+          echo "========================================"
+          echo "  Incident ID : ${option.incident_id}"
+          echo "  Description : ${option.description}"
+          echo "  Version     : ${option.version}"
+          echo "  Triggered by: ${job.username}"
+          echo "  Job ID      : ${job.execid}"
+          echo "  Timestamp   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "  Clusters    : eks-test-1 (staging) + eks-test-2 (prod)"
+          echo "  Canary      : SKIPPED (incident mode)"
+          echo "========================================"
+
+    # -------------------------------------------------------------------------
+    # Step 2 — ArgoCD sync: eks-test-1 (staging)
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "ArgoCD sync study-platform-test-1 (staging)"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          echo "[${option.incident_id}] Syncing ArgoCD application: study-platform-test-1"
+
+          argocd app sync study-platform-test-1 \
+            --auth-token "${ARGOCD_TOKEN}" \
+            --server argocd.eks-ops.internal \
+            --grpc-web \
+            --timeout 120 \
+            --retry-limit 2
+
+          echo "Waiting for healthy sync status on test-1..."
+          argocd app wait study-platform-test-1 \
+            --auth-token "${ARGOCD_TOKEN}" \
+            --server argocd.eks-ops.internal \
+            --grpc-web \
+            --sync \
+            --health \
+            --timeout 180
+
+          echo "study-platform-test-1 sync complete and healthy."
+
+    # -------------------------------------------------------------------------
+    # Step 3 — ArgoCD sync: eks-test-2 (prod)
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "ArgoCD sync study-platform-test-2 (prod)"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          echo "[${option.incident_id}] Syncing ArgoCD application: study-platform-test-2"
+
+          argocd app sync study-platform-test-2 \
+            --auth-token "${ARGOCD_TOKEN}" \
+            --server argocd.eks-ops.internal \
+            --grpc-web \
+            --timeout 120 \
+            --retry-limit 2
+
+          echo "Waiting for healthy sync status on test-2..."
+          argocd app wait study-platform-test-2 \
+            --auth-token "${ARGOCD_TOKEN}" \
+            --server argocd.eks-ops.internal \
+            --grpc-web \
+            --sync \
+            --health \
+            --timeout 180
+
+          echo "study-platform-test-2 sync complete and healthy."
+
+    # -------------------------------------------------------------------------
+    # Step 4 — Full rollout on test-1: 100% traffic to new version
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Full rollout eks-test-1 — 100% traffic to v2"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          echo "[${option.incident_id}] Applying full rollout on eks-test-1 (no canary)..."
+
+          kubectl patch virtualservice study-platform \
+            -n study-platform \
+            --context eks-test-1 \
+            --type merge \
+            -p '{
+              "spec": {
+                "http": [
+                  {
+                    "name": "incident-rollout",
+                    "route": [
+                      {
+                        "destination": {
+                          "host": "study-platform",
+                          "subset": "v2"
+                        },
+                        "weight": 100
+                      }
+                    ],
+                    "timeout": "30s",
+                    "retries": {
+                      "attempts": 3,
+                      "perTryTimeout": "10s",
+                      "retryOn": "gateway-error,connect-failure,retriable-4xx"
+                    }
+                  }
+                ]
+              }
+            }'
+
+          echo "eks-test-1: 100% traffic now on v2."
+
+    # -------------------------------------------------------------------------
+    # Step 5 — Full rollout on test-2: 100% traffic to new version
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Full rollout eks-test-2 — 100% traffic to v2"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          echo "[${option.incident_id}] Applying full rollout on eks-test-2 (no canary)..."
+
+          kubectl patch virtualservice study-platform \
+            -n study-platform \
+            --context eks-test-2 \
+            --type merge \
+            -p '{
+              "spec": {
+                "http": [
+                  {
+                    "name": "incident-rollout",
+                    "route": [
+                      {
+                        "destination": {
+                          "host": "study-platform",
+                          "subset": "v2"
+                        },
+                        "weight": 100
+                      }
+                    ],
+                    "timeout": "30s",
+                    "retries": {
+                      "attempts": 3,
+                      "perTryTimeout": "10s",
+                      "retryOn": "gateway-error,connect-failure,retriable-4xx"
+                    }
+                  }
+                ]
+              }
+            }'
+
+          echo "eks-test-2: 100% traffic now on v2."
+
+    # -------------------------------------------------------------------------
+    # Step 6 — Chainsaw post-deploy validation (both clusters)
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Chainsaw validation — eks-test-1"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          echo "[${option.incident_id}] Running Chainsaw tests against eks-test-1..."
+
+          chainsaw test \
+            --config /opt/chainsaw/chainsaw-config.yaml \
+            --test-dir /opt/chainsaw/tests/ \
+            --kubeconfig /opt/kubeconfig/eks-test-1 \
+            --parallel 4 \
+            --timeout 5m
+
+          echo "Chainsaw tests passed on eks-test-1."
+
+    - type: command
+      description: "Chainsaw validation — eks-test-2"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          echo "[${option.incident_id}] Running Chainsaw tests against eks-test-2..."
+
+          chainsaw test \
+            --config /opt/chainsaw/chainsaw-config.yaml \
+            --test-dir /opt/chainsaw/tests/ \
+            --kubeconfig /opt/kubeconfig/eks-test-2 \
+            --parallel 4 \
+            --timeout 5m
+
+          echo "Chainsaw tests passed on eks-test-2."
+
+    # -------------------------------------------------------------------------
+    # Step 7 — Log incident deploy complete
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Incident deploy complete"
+      configuration:
+        exec: |
+          echo "========================================"
+          echo "  INCIDENT DEPLOY COMPLETE"
+          echo "========================================"
+          echo "  Incident ID : ${option.incident_id}"
+          echo "  Description : ${option.description}"
+          echo "  Version     : ${option.version}"
+          echo "  Deployed by : ${job.username}"
+          echo "  Completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "  Clusters    : eks-test-1 + eks-test-2"
+          echo "========================================"
+          echo "Next steps:"
+          echo "  1. Verify application health in Grafana / Kiali"
+          echo "  2. Monitor error rate for 15 minutes"
+          echo "  3. Update incident ticket: ${option.incident_id}"
+          echo "  4. Open post-mortem PR"
+
+  # ---------------------------------------------------------------------------
+  # Error handlers — rollback both clusters on failure
+  # ---------------------------------------------------------------------------
+  errorhandlers:
+    - type: command
+      description: "Rollback both clusters on failure"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "  INCIDENT DEPLOY FAILED — ROLLBACK"
+          echo "========================================"
+          echo "  Incident ID : ${option.incident_id}"
+          echo "  Failed step : ${job.stepnum}"
+          echo "  Timestamp   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Restore VirtualService to 100% v1 on both clusters
+          for CTX in eks-test-1 eks-test-2; do
+            echo "Restoring VirtualService on ${CTX}..."
+            kubectl patch virtualservice study-platform \
+              -n study-platform \
+              --context "${CTX}" \
+              --type merge \
+              -p '{
+                "spec": {
+                  "http": [
+                    {
+                      "name": "rollback-traffic",
+                      "route": [
+                        {
+                          "destination": {
+                            "host": "study-platform",
+                            "subset": "v1"
+                          },
+                          "weight": 100
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }' || echo "WARNING: VirtualService patch failed on ${CTX}"
+          done
+
+          # ArgoCD rollback on both clusters
+          for APP in study-platform-test-1 study-platform-test-2; do
+            echo "Rolling back ${APP}..."
+            argocd app rollback "${APP}" \
+              --auth-token "${ARGOCD_TOKEN}" \
+              --server argocd.eks-ops.internal \
+              --grpc-web || echo "WARNING: rollback failed for ${APP}"
+          done
+
+          echo "Rollback complete. Verify health in ArgoCD and Grafana immediately."
+
+  # ---------------------------------------------------------------------------
+  # Notifications
+  # ---------------------------------------------------------------------------
+  notification:
+    onsuccess:
+      plugin:
+        type: slack-incoming-webhook
+        configuration:
+          webhook_url: "${globals.slack_webhook}"
+          message: |
+            *INCIDENT DEPLOY COMPLETE* :rotating_light: :white_check_mark:
+            *Incident:* ${option.incident_id}
+            *Description:* ${option.description}
+            *Version:* ${option.version}
+            *Deployed by:* ${job.username}
+            *Clusters:* eks-test-1 (staging) + eks-test-2 (prod)
+            *Canary:* SKIPPED (incident mode)
+            *Completed at:* <!date^${job.execid}^{date_time}|now>
+            *Rundeck job:* <${globals.rundeck_url}/project/deployments/execution/show/${job.execid}|View execution>
+            Next: monitor Grafana, update incident ticket, open post-mortem PR.
+          channel: "#incidents"
+
+    onfailure:
+      plugin:
+        type: slack-incoming-webhook
+        configuration:
+          webhook_url: "${globals.slack_webhook}"
+          message: |
+            *INCIDENT DEPLOY FAILED* :rotating_light: :x:
+            *Incident:* ${option.incident_id}
+            *Description:* ${option.description}
+            *Version:* ${option.version}
+            *Triggered by:* ${job.username}
+            *Failed at step:* ${job.stepnum}
+            *Rollback:* Initiated automatically on both clusters.
+            *Action required:* Verify rollback success in ArgoCD + Grafana immediately.
+            *Rundeck job:* <${globals.rundeck_url}/project/deployments/execution/show/${job.execid}|View execution>
+          channel: "#incidents"

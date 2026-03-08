@@ -1,0 +1,256 @@
+---
+# =============================================================================
+# playbooks/01-seed-cacerts.yaml
+#
+# Day-0: Generate a shared Istio root CA and intermediate CAs per cluster,
+# then seed the cacerts secret into istio-system on eks-test-1 and eks-test-2.
+#
+# The same root CA must be used by both clusters to establish mTLS trust
+# across the mesh boundary (multi-primary federation).
+#
+# Usage:
+#   ansible-playbook playbooks/01-seed-cacerts.yaml
+#
+# Prerequisites:
+#   openssl >= 1.1, kubectl, valid kubeconfigs for eks-test-1 and eks-test-2
+# =============================================================================
+
+- name: "01-seed-cacerts | Generate and distribute Istio CA certificates"
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    _certs_dir: "{{ istio_certs_dir }}"
+    _root_dir: "{{ _certs_dir }}/root-ca"
+    _root_key: "{{ _root_dir }}/root-key.pem"
+    _root_cert: "{{ _root_dir }}/root-cert.pem"
+    _root_serial: "{{ _root_dir }}/root-ca.srl"
+    _ca_days: 3650     # 10-year root CA
+    _int_days: 1825    # 5-year intermediate CA
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # 1. Local certificate directory setup
+    # -------------------------------------------------------------------------
+    - name: "CA setup | Create local certs directory tree"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ _certs_dir }}"
+        - "{{ _root_dir }}"
+        - "{{ _certs_dir }}/eks-test-1"
+        - "{{ _certs_dir }}/eks-test-2"
+
+    # -------------------------------------------------------------------------
+    # 2. Root CA (created once; idempotent — skipped if root-cert.pem exists)
+    # -------------------------------------------------------------------------
+    - name: "CA setup | Check if root CA already exists"
+      ansible.builtin.stat:
+        path: "{{ _root_cert }}"
+      register: _root_cert_stat
+
+    - name: "CA setup | Generate root CA private key (4096-bit RSA)"
+      ansible.builtin.command:
+        cmd: >-
+          openssl genrsa -out {{ _root_key }} 4096
+        creates: "{{ _root_key }}"
+      when: not _root_cert_stat.stat.exists
+
+    - name: "CA setup | Generate self-signed root CA certificate"
+      ansible.builtin.command:
+        cmd: >-
+          openssl req -new -x509
+          -days {{ _ca_days }}
+          -key {{ _root_key }}
+          -out {{ _root_cert }}
+          -subj "/O=study-platform/CN=study-platform Root CA"
+          -extensions v3_ca
+      args:
+        creates: "{{ _root_cert }}"
+      when: not _root_cert_stat.stat.exists
+
+    - name: "CA setup | Set restrictive permissions on root key"
+      ansible.builtin.file:
+        path: "{{ _root_key }}"
+        mode: "0600"
+
+    # -------------------------------------------------------------------------
+    # 3. Intermediate CA per cluster
+    # -------------------------------------------------------------------------
+    - name: "CA setup | Generate intermediate CA for each spoke cluster"
+      ansible.builtin.include_tasks: _subtasks/generate-intermediate-ca.yaml
+      loop:
+        - cluster: eks-test-1
+          cn: "study-platform Intermediate CA - eks-test-1"
+        - cluster: eks-test-2
+          cn: "study-platform Intermediate CA - eks-test-2"
+      loop_control:
+        loop_var: _ca_item
+
+    # -------------------------------------------------------------------------
+    # 4. Verify intermediate certs can chain up to the root
+    # -------------------------------------------------------------------------
+    - name: "CA verify | Verify cert chain for eks-test-1"
+      ansible.builtin.command:
+        cmd: >-
+          openssl verify
+          -CAfile {{ _root_cert }}
+          {{ _certs_dir }}/eks-test-1/ca-cert.pem
+      changed_when: false
+
+    - name: "CA verify | Verify cert chain for eks-test-2"
+      ansible.builtin.command:
+        cmd: >-
+          openssl verify
+          -CAfile {{ _root_cert }}
+          {{ _certs_dir }}/eks-test-2/ca-cert.pem
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # 5. Seed cacerts secret to eks-test-1
+    # -------------------------------------------------------------------------
+    - name: "eks-test-1 | Update kubeconfig for eks-test-1"
+      ansible.builtin.command:
+        cmd: >-
+          aws eks update-kubeconfig
+          --region {{ aws_region }}
+          --name eks-test-1
+          --alias eks-test-1
+      changed_when: false
+
+    - name: "eks-test-1 | Ensure istio-system namespace exists"
+      kubernetes.core.k8s:
+        context: eks-test-1
+        api_version: v1
+        kind: Namespace
+        name: istio-system
+        state: present
+
+    - name: "eks-test-1 | Read CA cert files into vars"
+      ansible.builtin.slurp:
+        src: "{{ _certs_dir }}/eks-test-1/{{ item }}"
+      register: _t1_certs
+      loop:
+        - ca-cert.pem
+        - ca-key.pem
+        - root-cert.pem
+        - cert-chain.pem
+
+    - name: "eks-test-1 | Build cert data dict"
+      ansible.builtin.set_fact:
+        _t1_cert_data: >-
+          {{
+            _t1_cert_data | default({}) |
+            combine({ item.item: item.content | b64decode })
+          }}
+      loop: "{{ _t1_certs.results }}"
+
+    - name: "eks-test-1 | Create/update cacerts secret in istio-system"
+      kubernetes.core.k8s:
+        context: eks-test-1
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: cacerts
+            namespace: istio-system
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              app.kubernetes.io/component: istio-ca
+          type: Opaque
+          stringData:
+            ca-cert.pem: "{{ _t1_cert_data['ca-cert.pem'] }}"
+            ca-key.pem: "{{ _t1_cert_data['ca-key.pem'] }}"
+            root-cert.pem: "{{ _t1_cert_data['root-cert.pem'] }}"
+            cert-chain.pem: "{{ _t1_cert_data['cert-chain.pem'] }}"
+
+    # -------------------------------------------------------------------------
+    # 6. Seed cacerts secret to eks-test-2
+    # -------------------------------------------------------------------------
+    - name: "eks-test-2 | Update kubeconfig for eks-test-2"
+      ansible.builtin.command:
+        cmd: >-
+          aws eks update-kubeconfig
+          --region {{ aws_region }}
+          --name eks-test-2
+          --alias eks-test-2
+      changed_when: false
+
+    - name: "eks-test-2 | Ensure istio-system namespace exists"
+      kubernetes.core.k8s:
+        context: eks-test-2
+        api_version: v1
+        kind: Namespace
+        name: istio-system
+        state: present
+
+    - name: "eks-test-2 | Read CA cert files into vars"
+      ansible.builtin.slurp:
+        src: "{{ _certs_dir }}/eks-test-2/{{ item }}"
+      register: _t2_certs
+      loop:
+        - ca-cert.pem
+        - ca-key.pem
+        - root-cert.pem
+        - cert-chain.pem
+
+    - name: "eks-test-2 | Build cert data dict"
+      ansible.builtin.set_fact:
+        _t2_cert_data: >-
+          {{
+            _t2_cert_data | default({}) |
+            combine({ item.item: item.content | b64decode })
+          }}
+      loop: "{{ _t2_certs.results }}"
+
+    - name: "eks-test-2 | Create/update cacerts secret in istio-system"
+      kubernetes.core.k8s:
+        context: eks-test-2
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: cacerts
+            namespace: istio-system
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              app.kubernetes.io/component: istio-ca
+          type: Opaque
+          stringData:
+            ca-cert.pem: "{{ _t2_cert_data['ca-cert.pem'] }}"
+            ca-key.pem: "{{ _t2_cert_data['ca-key.pem'] }}"
+            root-cert.pem: "{{ _t2_cert_data['root-cert.pem'] }}"
+            cert-chain.pem: "{{ _t2_cert_data['cert-chain.pem'] }}"
+
+    # -------------------------------------------------------------------------
+    # 7. Verify secrets are present on both clusters
+    # -------------------------------------------------------------------------
+    - name: "Verify | Check cacerts secret on eks-test-1"
+      kubernetes.core.k8s_info:
+        context: eks-test-1
+        api_version: v1
+        kind: Secret
+        name: cacerts
+        namespace: istio-system
+      register: _t1_secret
+      failed_when: _t1_secret.resources | length == 0
+
+    - name: "Verify | Check cacerts secret on eks-test-2"
+      kubernetes.core.k8s_info:
+        context: eks-test-2
+        api_version: v1
+        kind: Secret
+        name: cacerts
+        namespace: istio-system
+      register: _t2_secret
+      failed_when: _t2_secret.resources | length == 0
+
+    - name: "Verify | Print cacerts status"
+      ansible.builtin.debug:
+        msg:
+          - "eks-test-1 cacerts secret: PRESENT (keys={{ _t1_secret.resources[0].data.keys() | list | sort | join(', ') }})"
+          - "eks-test-2 cacerts secret: PRESENT (keys={{ _t2_secret.resources[0].data.keys() | list | sort | join(', ') }})"

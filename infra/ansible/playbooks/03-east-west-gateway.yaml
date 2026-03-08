@@ -1,0 +1,305 @@
+---
+# =============================================================================
+# playbooks/03-east-west-gateway.yaml
+#
+# Day-0: Install the Istio east-west gateway on eks-test-1 and eks-test-2.
+# The east-west gateway exposes services to the other cluster via port 15443
+# (mTLS SNI-based routing).  After the gateway is ready, all services in
+# *.local are exposed so cross-cluster endpoint discovery can discover them.
+#
+# Usage:
+#   ansible-playbook playbooks/03-east-west-gateway.yaml
+#
+# Prerequisites:
+#   - 02-install-istio.yaml must have succeeded (istiod ready on both clusters)
+# =============================================================================
+
+- name: "03-east-west-gateway | Install east-west gateways on spoke clusters"
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # 1. Write east-west gateway IstioOperator manifests
+    # -------------------------------------------------------------------------
+    - name: "manifest | Write east-west gateway IstioOperator for eks-test-1"
+      ansible.builtin.copy:
+        dest: /tmp/ew-gateway-eks-test-1.yaml
+        mode: "0644"
+        content: |
+          apiVersion: install.istio.io/v1alpha1
+          kind: IstioOperator
+          metadata:
+            name: eastwest-gateway-eks-test-1
+            namespace: istio-system
+          spec:
+            profile: empty
+            values:
+              global:
+                meshID: {{ istio_mesh_id }}
+                multiCluster:
+                  clusterName: eks-test-1
+                network: network-test-1
+            components:
+              ingressGateways:
+                - name: istio-eastwestgateway
+                  label:
+                    istio: eastwestgateway
+                    app: istio-eastwestgateway
+                    topology.istio.io/network: network-test-1
+                  enabled: true
+                  k8s:
+                    replicaCount: 2
+                    env:
+                      - name: ISTIO_META_ROUTER_MODE
+                        value: sni-dnat
+                      - name: ISTIO_META_REQUESTED_NETWORK_VIEW
+                        value: network-test-1
+                    service:
+                      type: LoadBalancer
+                      annotations:
+                        service.beta.kubernetes.io/aws-load-balancer-type: external
+                        service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+                        service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+                      ports:
+                        - name: status-port
+                          port: 15021
+                          targetPort: 15021
+                        - name: tls
+                          port: 15443
+                          targetPort: 15443
+                        - name: tls-istiod
+                          port: 15012
+                          targetPort: 15012
+                        - name: tls-webhook
+                          port: 15017
+                          targetPort: 15017
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 128Mi
+                      limits:
+                        cpu: "2"
+                        memory: 1Gi
+                    affinity:
+                      podAntiAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                          - labelSelector:
+                              matchLabels:
+                                app: istio-eastwestgateway
+                            topologyKey: kubernetes.io/hostname
+
+    - name: "manifest | Write east-west gateway IstioOperator for eks-test-2"
+      ansible.builtin.copy:
+        dest: /tmp/ew-gateway-eks-test-2.yaml
+        mode: "0644"
+        content: |
+          apiVersion: install.istio.io/v1alpha1
+          kind: IstioOperator
+          metadata:
+            name: eastwest-gateway-eks-test-2
+            namespace: istio-system
+          spec:
+            profile: empty
+            values:
+              global:
+                meshID: {{ istio_mesh_id }}
+                multiCluster:
+                  clusterName: eks-test-2
+                network: network-test-2
+            components:
+              ingressGateways:
+                - name: istio-eastwestgateway
+                  label:
+                    istio: eastwestgateway
+                    app: istio-eastwestgateway
+                    topology.istio.io/network: network-test-2
+                  enabled: true
+                  k8s:
+                    replicaCount: 2
+                    env:
+                      - name: ISTIO_META_ROUTER_MODE
+                        value: sni-dnat
+                      - name: ISTIO_META_REQUESTED_NETWORK_VIEW
+                        value: network-test-2
+                    service:
+                      type: LoadBalancer
+                      annotations:
+                        service.beta.kubernetes.io/aws-load-balancer-type: external
+                        service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+                        service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+                      ports:
+                        - name: status-port
+                          port: 15021
+                          targetPort: 15021
+                        - name: tls
+                          port: 15443
+                          targetPort: 15443
+                        - name: tls-istiod
+                          port: 15012
+                          targetPort: 15012
+                        - name: tls-webhook
+                          port: 15017
+                          targetPort: 15017
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 128Mi
+                      limits:
+                        cpu: "2"
+                        memory: 1Gi
+                    affinity:
+                      podAntiAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                          - labelSelector:
+                              matchLabels:
+                                app: istio-eastwestgateway
+                            topologyKey: kubernetes.io/hostname
+
+    # -------------------------------------------------------------------------
+    # 2. Write the expose-services Gateway + VirtualService
+    # -------------------------------------------------------------------------
+    - name: "manifest | Write expose-services.yaml (exposes *.local via east-west GW)"
+      ansible.builtin.copy:
+        dest: /tmp/expose-services.yaml
+        mode: "0644"
+        content: |
+          # Expose ALL services to the east-west gateway via SNI passthrough.
+          # Applied to both clusters after the east-west gateway is ready.
+          apiVersion: networking.istio.io/v1alpha3
+          kind: Gateway
+          metadata:
+            name: cross-network-gateway
+            namespace: istio-system
+          spec:
+            selector:
+              istio: eastwestgateway
+            servers:
+              - port:
+                  number: 15443
+                  name: tls
+                  protocol: TLS
+                tls:
+                  mode: AUTO_PASSTHROUGH
+                hosts:
+                  - "*.local"
+
+    # -------------------------------------------------------------------------
+    # 3. Install east-west gateway on eks-test-1
+    # -------------------------------------------------------------------------
+    - name: "eks-test-1 | Install east-west gateway via istioctl"
+      ansible.builtin.command:
+        cmd: >-
+          {{ istioctl_path }} install
+          --context eks-test-1
+          -f /tmp/ew-gateway-eks-test-1.yaml
+          --skip-confirmation
+      register: _ew_t1_install
+      changed_when: "'No changes' not in _ew_t1_install.stdout"
+
+    - name: "eks-test-1 | Wait for east-west gateway pods to be ready"
+      kubernetes.core.k8s_info:
+        context: eks-test-1
+        api_version: apps/v1
+        kind: Deployment
+        name: istio-eastwestgateway
+        namespace: istio-system
+      register: _ew_t1_deploy
+      until: >-
+        _ew_t1_deploy.resources | length > 0 and
+        (_ew_t1_deploy.resources[0].status.readyReplicas | default(0)) >=
+        (_ew_t1_deploy.resources[0].spec.replicas | default(2))
+      retries: 30
+      delay: 20
+
+    - name: "eks-test-1 | Wait for east-west gateway LoadBalancer to get an address"
+      kubernetes.core.k8s_info:
+        context: eks-test-1
+        api_version: v1
+        kind: Service
+        name: istio-eastwestgateway
+        namespace: istio-system
+      register: _ew_t1_svc
+      until: >-
+        _ew_t1_svc.resources | length > 0 and
+        (_ew_t1_svc.resources[0].status.loadBalancer.ingress | default([]) | length > 0)
+      retries: 30
+      delay: 20
+
+    - name: "eks-test-1 | Store east-west gateway address"
+      ansible.builtin.set_fact:
+        ew_gateway_t1_hostname: >-
+          {{ _ew_t1_svc.resources[0].status.loadBalancer.ingress[0].hostname |
+             default(_ew_t1_svc.resources[0].status.loadBalancer.ingress[0].ip) }}
+
+    - name: "eks-test-1 | Apply cross-network-gateway (expose *.local services)"
+      kubernetes.core.k8s:
+        context: eks-test-1
+        state: present
+        src: /tmp/expose-services.yaml
+
+    # -------------------------------------------------------------------------
+    # 4. Install east-west gateway on eks-test-2
+    # -------------------------------------------------------------------------
+    - name: "eks-test-2 | Install east-west gateway via istioctl"
+      ansible.builtin.command:
+        cmd: >-
+          {{ istioctl_path }} install
+          --context eks-test-2
+          -f /tmp/ew-gateway-eks-test-2.yaml
+          --skip-confirmation
+      register: _ew_t2_install
+      changed_when: "'No changes' not in _ew_t2_install.stdout"
+
+    - name: "eks-test-2 | Wait for east-west gateway pods to be ready"
+      kubernetes.core.k8s_info:
+        context: eks-test-2
+        api_version: apps/v1
+        kind: Deployment
+        name: istio-eastwestgateway
+        namespace: istio-system
+      register: _ew_t2_deploy
+      until: >-
+        _ew_t2_deploy.resources | length > 0 and
+        (_ew_t2_deploy.resources[0].status.readyReplicas | default(0)) >=
+        (_ew_t2_deploy.resources[0].spec.replicas | default(2))
+      retries: 30
+      delay: 20
+
+    - name: "eks-test-2 | Wait for east-west gateway LoadBalancer to get an address"
+      kubernetes.core.k8s_info:
+        context: eks-test-2
+        api_version: v1
+        kind: Service
+        name: istio-eastwestgateway
+        namespace: istio-system
+      register: _ew_t2_svc
+      until: >-
+        _ew_t2_svc.resources | length > 0 and
+        (_ew_t2_svc.resources[0].status.loadBalancer.ingress | default([]) | length > 0)
+      retries: 30
+      delay: 20
+
+    - name: "eks-test-2 | Store east-west gateway address"
+      ansible.builtin.set_fact:
+        ew_gateway_t2_hostname: >-
+          {{ _ew_t2_svc.resources[0].status.loadBalancer.ingress[0].hostname |
+             default(_ew_t2_svc.resources[0].status.loadBalancer.ingress[0].ip) }}
+
+    - name: "eks-test-2 | Apply cross-network-gateway (expose *.local services)"
+      kubernetes.core.k8s:
+        context: eks-test-2
+        state: present
+        src: /tmp/expose-services.yaml
+
+    # -------------------------------------------------------------------------
+    # 5. Summary
+    # -------------------------------------------------------------------------
+    - name: "Summary | East-west gateway addresses"
+      ansible.builtin.debug:
+        msg:
+          - "East-west gateways ready on both clusters."
+          - "eks-test-1 EW gateway: {{ ew_gateway_t1_hostname }}:{{ istio_east_west_gateway_port }}"
+          - "eks-test-2 EW gateway: {{ ew_gateway_t2_hostname }}:{{ istio_east_west_gateway_port }}"
+          - "cross-network-gateway applied to both clusters."
+          - "Next: run 04-remote-secrets.yaml"

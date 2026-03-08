@@ -1,0 +1,78 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: study-platform
+  namespace: study-platform
+  labels:
+    app: study-platform
+    app.kubernetes.io/name: study-platform
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: study-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: study-platform
+
+  # Base replica bounds — overlays can patch minReplicas per environment:
+  #   test-1 (staging): min=2, max=6  (lower ceiling, cost control)
+  #   test-2 (prod):    min=3, max=10 (higher floor for prod SLO)
+  minReplicas: 2
+  maxReplicas: 10
+
+  metrics:
+    # ── CPU utilisation ───────────────────────────────────────────────────────
+    # Scale out when average CPU across all pods exceeds 70% of the request.
+    # Matches SRE alert threshold (P3: CPU > 80% sustained 30m).
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # ── Memory utilisation ────────────────────────────────────────────────────
+    # Memory leaks are hard to detect without this signal.
+    # Scale out when average memory exceeds 80% of the request.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+  behavior:
+    # ── Scale-out policy ──────────────────────────────────────────────────────
+    scaleUp:
+      # Stabilise for 30s before triggering another scale-up to avoid thrashing
+      stabilizationWindowSeconds: 30
+      policies:
+        # Fast scale-up: add up to 4 pods per 60s if under high load
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+        # But never more than 100% of current replicas in one step
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+      # Take whichever policy allows the most pods (faster reaction under spike)
+      selectPolicy: Max
+
+    # ── Scale-in policy ───────────────────────────────────────────────────────
+    scaleDown:
+      # Wait 5 minutes of stable low load before scaling in.
+      # Prevents premature scale-down during brief lulls (end of burst).
+      stabilizationWindowSeconds: 300
+      policies:
+        # Conservative scale-in: remove at most 1 pod per 2 minutes
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+        # Never remove more than 25% of pods at once (protects SLO)
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+      # Take the most conservative policy (fewest pods removed)
+      selectPolicy: Min

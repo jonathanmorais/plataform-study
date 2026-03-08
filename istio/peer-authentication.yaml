@@ -1,0 +1,38 @@
+# PeerAuthentication — Strict mTLS for study-platform namespace
+#
+# This resource enforces mutual TLS (mTLS) for ALL pod-to-pod communication
+# within the study-platform namespace on both eks-test-1 (staging) and
+# eks-test-2 (prod). With mode STRICT, Istio will reject any plaintext
+# connection — every service must present a valid SPIFFE certificate issued
+# by the shared intermediate CA seeded during Day-0 bootstrap.
+#
+# Apply to: eks-test-1 and eks-test-2 (NOT eks-ops — no Istio mesh there).
+#
+# Relationship to shared CA:
+#   Both clusters share a common root CA (cacerts secret in istio-system),
+#   which means SPIFFE IDs issued on test-1 are trusted by test-2 and vice
+#   versa. This is what allows cross-cluster East-West traffic to be mTLS'd
+#   end-to-end without any certificate exceptions.
+#
+# To temporarily relax (last resort during mesh debugging only):
+#   kubectl patch peerauthentication default -n study-platform \
+#     --type merge -p '{"spec":{"mtls":{"mode":"PERMISSIVE"}}}'
+#   # Restore STRICT immediately after diagnosis.
+#
+# Apply:
+#   kubectl apply -f istio/peer-authentication.yaml --context eks-test-1
+#   kubectl apply -f istio/peer-authentication.yaml --context eks-test-2
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: study-platform
+  labels:
+    app.kubernetes.io/part-of: study-platform
+    app.kubernetes.io/managed-by: argocd
+spec:
+  # No selector — applies to ALL workloads in the namespace.
+  # This ensures every pod (including future deployments) is subject to
+  # STRICT mTLS without requiring per-workload configuration.
+  mtls:
+    mode: STRICT

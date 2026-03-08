@@ -1,0 +1,173 @@
+---
+# ============================================================================
+# group_vars/all.yaml
+# Variables applied to every host in every play.
+# Override per-cluster in group_vars/eks_staging.yaml, eks_prod.yaml, etc.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# AWS globals
+# ----------------------------------------------------------------------------
+aws_region: us-east-1
+aws_account_id: "{{ lookup('env', 'AWS_ACCOUNT_ID') }}"
+
+# ----------------------------------------------------------------------------
+# EKS cluster names
+# ----------------------------------------------------------------------------
+eks_clusters:
+  - eks-ops
+  - eks-test-1
+  - eks-test-2
+
+eks_spoke_clusters:
+  - name: eks-test-1
+    network: network-test-1
+    environment: staging
+    context: "arn:aws:eks:{{ aws_region }}:{{ aws_account_id }}:cluster/eks-test-1"
+  - name: eks-test-2
+    network: network-test-2
+    environment: production
+    context: "arn:aws:eks:{{ aws_region }}:{{ aws_account_id }}:cluster/eks-test-2"
+
+eks_ops_context: "arn:aws:eks:{{ aws_region }}:{{ aws_account_id }}:cluster/eks-ops"
+
+# ----------------------------------------------------------------------------
+# Istio
+# ----------------------------------------------------------------------------
+istio_version: "1.21.0"
+istio_download_url: "https://github.com/istio/istio/releases/download/{{ istio_version }}/istio-{{ istio_version }}-linux-amd64.tar.gz"
+istio_install_dir: "/usr/local/istio-{{ istio_version }}"
+istioctl_path: "{{ istio_install_dir }}/bin/istioctl"
+istio_mesh_id: study-mesh
+istio_namespace: istio-system
+istio_east_west_gateway_port: 15443
+
+# Istio CA certificates local staging directory (on Ansible control node)
+istio_certs_dir: "{{ playbook_dir }}/../certs"
+
+# ----------------------------------------------------------------------------
+# ArgoCD
+# ----------------------------------------------------------------------------
+argocd_version: "v2.10.0"
+argocd_namespace: argocd
+argocd_server_service: argocd-server
+argocd_install_url: "https://raw.githubusercontent.com/argoproj/argo-cd/{{ argocd_version }}/manifests/install.yaml"
+argocd_cli_url: "https://github.com/argoproj/argo-cd/releases/download/{{ argocd_version }}/argocd-linux-amd64"
+argocd_cli_path: /usr/local/bin/argocd
+
+# ----------------------------------------------------------------------------
+# Application / platform
+# ----------------------------------------------------------------------------
+study_platform_namespace: study-platform
+study_platform_project: study-platform
+
+# ----------------------------------------------------------------------------
+# AMI build
+# ----------------------------------------------------------------------------
+ami_base_ssm_path: /study-platform/eks/ami
+
+# Base EKS-optimised AMI (Amazon Linux 2 for k8s 1.29) — updated via SSM
+ami_base_id: "{{ lookup('aws_ssm', '/aws/service/eks/optimized-ami/1.29/amazon-linux-2/recommended/image_id', region=aws_region) }}"
+
+# Builder instance configuration
+ami_builder_instance_type: m5.xlarge
+ami_builder_subnet_id: "{{ lookup('env', 'AMI_BUILDER_SUBNET_ID') }}"
+ami_builder_security_group_id: "{{ lookup('env', 'AMI_BUILDER_SG_ID') }}"
+ami_builder_iam_instance_profile: study-platform-ami-builder
+ami_builder_key_name: eks-study-platform
+ami_builder_volume_size_gb: 50
+
+# AMI name and tags
+ami_name_prefix: study-platform-eks-node
+
+# ----------------------------------------------------------------------------
+# Software versions (pinned for reproducibility)
+# ----------------------------------------------------------------------------
+containerd_version: "1.7.13"
+kubernetes_version: "1.29"
+runc_version: "1.1.12"
+cni_plugins_version: "1.4.0"
+amazon_ssm_agent_rpm: "https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm"
+cloudwatch_agent_rpm: "https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm"
+
+# ECR registry mirror (regional)
+ecr_registry_mirror: "{{ aws_account_id }}.dkr.ecr.{{ aws_region }}.amazonaws.com"
+
+# pause image (must match k8s version in EKS AMI)
+sandbox_pause_image: "602401143452.dkr.ecr.{{ aws_region }}.amazonaws.com/eks/pause:3.9"
+
+# ----------------------------------------------------------------------------
+# Security hardening
+# ----------------------------------------------------------------------------
+sysctl_hardening_params:
+  # Network
+  net.ipv4.tcp_syncookies: 1
+  net.ipv4.conf.all.rp_filter: 1
+  net.ipv4.conf.default.rp_filter: 1
+  net.ipv4.conf.all.accept_redirects: 0
+  net.ipv4.conf.default.accept_redirects: 0
+  net.ipv4.conf.all.secure_redirects: 0
+  net.ipv4.conf.all.send_redirects: 0
+  net.ipv4.conf.all.log_martians: 1
+  net.ipv4.icmp_echo_ignore_broadcasts: 1
+  net.ipv4.icmp_ignore_bogus_error_responses: 1
+  net.ipv6.conf.all.disable_ipv6: 1
+  net.ipv6.conf.default.disable_ipv6: 1
+  # Kernel
+  kernel.randomize_va_space: 2
+  kernel.dmesg_restrict: 1
+  kernel.kptr_restrict: 2
+  kernel.yama.ptrace_scope: 1
+  fs.suid_dumpable: 0
+  # File descriptors / inotify
+  fs.file-max: 1048576
+  fs.inotify.max_user_watches: 524288
+  fs.inotify.max_user_instances: 512
+
+istio_sysctl_params:
+  net.ipv4.ip_forward: 1
+  net.bridge.bridge-nf-call-iptables: 1
+  net.bridge.bridge-nf-call-ip6tables: 1
+  fs.inotify.max_user_watches: 524288
+  fs.inotify.max_user_instances: 512
+
+# Kernel modules to disable on hardened AMI
+disabled_kernel_modules:
+  - dccp
+  - sctp
+  - rds
+  - tipc
+  - n-hdlc
+  - ax25
+  - netrom
+  - x25
+  - rose
+  - decnet
+  - econet
+  - af_802154
+  - ipx
+  - appletalk
+  - psnap
+  - p8023
+  - p8022
+  - can
+  - atm
+
+# Services to disable on AMI
+disabled_services:
+  - bluetooth
+  - cups
+  - avahi-daemon
+  - postfix
+  - rpcbind
+  - nfs
+  - nfs-server
+  - rpc-statd
+
+# ----------------------------------------------------------------------------
+# Retry / wait configuration
+# ----------------------------------------------------------------------------
+k8s_wait_timeout: 600       # seconds to wait for k8s resources
+ssh_wait_timeout: 600       # seconds to wait for SSH on builder
+ssh_wait_delay: 15          # initial delay before first SSH probe
+ami_available_timeout: 1800 # seconds to wait for AMI to become available

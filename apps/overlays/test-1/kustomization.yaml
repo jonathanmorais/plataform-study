@@ -1,0 +1,91 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ── Staging overlay (eks-test-1) ──────────────────────────────────────────────
+# Auto-sync enabled in ArgoCD — every merge to develop immediately deploys here.
+
+namespace: study-platform
+
+resources:
+  - ../../base
+  - namespace.yaml
+
+# ── Image tag management ──────────────────────────────────────────────────────
+# CI pipeline (_base.yaml) updates newTag after every successful ECR push.
+# Command used by CI:
+#   cd apps/overlays/test-1
+#   kustomize edit set image REGISTRY/study-platform=REGISTRY/study-platform:${GIT_SHA}
+images:
+  - name: REGISTRY/study-platform
+    newName: REGISTRY/study-platform
+    newTag: latest   # CI replaces this with the actual git SHA tag
+
+# ── Environment labels ────────────────────────────────────────────────────────
+commonLabels:
+  environment: staging
+  cluster: eks-test-1
+
+# ── ConfigMap patches — per-environment values ────────────────────────────────
+patches:
+  # Patch APP_ENV to "staging"
+  - target:
+      kind: ConfigMap
+      name: study-platform-config
+    patch: |-
+      - op: replace
+        path: /data/APP_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: debug
+      - op: replace
+        path: /data/OTEL_TRACES_SAMPLER_ARG
+        value: "0.5"
+      - op: replace
+        path: /data/DB_POOL_MAX
+        value: "5"
+
+  # Staging: 2 replicas — enough to test HA without burning cost
+  - target:
+      kind: Deployment
+      name: study-platform
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  # Staging resource limits — lower than prod to keep cost down
+  - target:
+      kind: Deployment
+      name: study-platform
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+
+  # HPA: smaller ceiling for staging
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: study-platform
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 6
+
+  # PDB: minAvailable=1 is fine for staging (same as base, explicit here)
+  - target:
+      kind: PodDisruptionBudget
+      name: study-platform
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 1

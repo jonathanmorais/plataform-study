@@ -1,0 +1,387 @@
+# Rundeck Job Definition — Deploy to Production
+# Stored in: rundeck/jobs/prod-deploy.yaml
+# Loaded by ArgoCD onto eks-ops and imported via Rundeck API or file-based job loader.
+#
+# Flow:
+#   1. Log deploy metadata (description, version, scheduled-by)
+#   2. Trigger ArgoCD sync on eks-test-2 (prod)
+#   3. Patch Istio VirtualService to 10/90 canary (unless skip_canary=true)
+#   4. Sleep 600s — observe canary traffic (conditional on skip_canary=false)
+#   5. Query Prometheus error rate — abort if > 1%
+#   6. Patch VirtualService to 100/0 full rollout
+#   7. Run Chainsaw post-deploy validation tests
+#   8. Log deploy complete
+#
+# Error handler: argocd app rollback + Slack alert on any step failure.
+# Notifications: Slack on success and failure via global webhook.
+
+- id: prod-deploy
+  name: "Deploy to Production"
+  description: >
+    Scheduled production deployment via ArgoCD.
+    Performs a canary rollout (10% → 100%) with Prometheus error-rate gate.
+    Engineers schedule this job from the Rundeck UI, choosing the exact
+    date, time, version, and a deploy description for the audit trail.
+  group: "deployments"
+  loglevel: INFO
+  timeout: "30m"
+
+  # Schedule is left disabled by default.
+  # Engineers use the Rundeck UI date/time picker to schedule a one-off execution.
+  schedule:
+    enabled: false
+    # Example — set by UI at runtime:
+    # crontab: "0 0 2 11 3 ? 2025"   # 2025-03-11 02:00 UTC
+
+  options:
+    - name: description
+      label: "Deploy Description"
+      description: >
+        Brief explanation of what is being deployed and why.
+        This appears in the Rundeck audit trail and Slack notifications.
+        Example: "v1.5.0 — resolves checkout timeout issue from INC-0041"
+      required: true
+      multivalued: false
+
+    - name: version
+      label: "Version / Release Tag"
+      description: >
+        The semver tag or Git SHA to deploy. Must match an image pushed to ECR.
+        Example: v1.5.0
+      required: true
+      multivalued: false
+      regex: "^v?[0-9]+\\.[0-9]+\\.[0-9]+.*$"
+
+    - name: skip_canary
+      label: "Skip Canary (incident mode only)"
+      description: >
+        Set to true for incident deploys to bypass the 10-minute canary window.
+        Should remain false for all scheduled production deploys.
+      required: false
+      type: Select
+      values:
+        - "false"
+        - "true"
+      default: "false"
+
+  steps:
+    # -------------------------------------------------------------------------
+    # Step 1 — Log deploy metadata for audit trail
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Log deploy info"
+      configuration:
+        exec: |
+          echo "========================================"
+          echo "  PRODUCTION DEPLOY STARTING"
+          echo "========================================"
+          echo "  Description : ${option.description}"
+          echo "  Version     : ${option.version}"
+          echo "  Scheduled by: ${job.username}"
+          echo "  Job ID      : ${job.execid}"
+          echo "  Timestamp   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "  Skip canary : ${option.skip_canary}"
+          echo "========================================"
+
+    # -------------------------------------------------------------------------
+    # Step 2 — ArgoCD sync: apply manifests to eks-test-2 (prod)
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "ArgoCD sync study-platform-test-2"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          echo "Syncing ArgoCD application: study-platform-test-2"
+
+          argocd app sync study-platform-test-2 \
+            --auth-token "${ARGOCD_TOKEN}" \
+            --server argocd.eks-ops.internal \
+            --grpc-web \
+            --timeout 120 \
+            --retry-limit 2
+
+          echo "Waiting for healthy sync status..."
+          argocd app wait study-platform-test-2 \
+            --auth-token "${ARGOCD_TOKEN}" \
+            --server argocd.eks-ops.internal \
+            --grpc-web \
+            --sync \
+            --health \
+            --timeout 180
+
+          echo "ArgoCD sync complete and application is healthy."
+
+    # -------------------------------------------------------------------------
+    # Step 3 — Canary: shift 10% of traffic to new version (v2)
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Canary rollout — 10% traffic to v2"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          if [ "${option.skip_canary}" = "false" ]; then
+            echo "Applying canary: 10% -> v2, 90% -> v1"
+
+            kubectl patch virtualservice study-platform \
+              -n study-platform \
+              --context eks-test-2 \
+              --type merge \
+              -p '{
+                "spec": {
+                  "http": [
+                    {
+                      "name": "canary-split",
+                      "route": [
+                        {
+                          "destination": {
+                            "host": "study-platform",
+                            "subset": "v2"
+                          },
+                          "weight": 10
+                        },
+                        {
+                          "destination": {
+                            "host": "study-platform",
+                            "subset": "v1"
+                          },
+                          "weight": 90
+                        }
+                      ],
+                      "timeout": "30s",
+                      "retries": {
+                        "attempts": 3,
+                        "perTryTimeout": "10s",
+                        "retryOn": "gateway-error,connect-failure,retriable-4xx"
+                      }
+                    }
+                  ]
+                }
+              }'
+
+            echo "Canary active: 10% traffic routing to v2."
+          else
+            echo "skip_canary=true — skipping canary step."
+          fi
+
+    # -------------------------------------------------------------------------
+    # Step 4 — Sleep 600s to observe canary traffic (skipped if skip_canary=true)
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Monitor canary window (10 minutes)"
+      configuration:
+        exec: |
+          if [ "${option.skip_canary}" = "false" ]; then
+            echo "Canary monitoring window: sleeping 600 seconds (10 minutes)."
+            echo "Monitor Grafana / Kiali during this window."
+            echo "Start time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            sleep 600
+            echo "End time  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Canary window complete."
+          else
+            echo "skip_canary=true — skipping sleep step."
+          fi
+
+    # -------------------------------------------------------------------------
+    # Step 5 — Prometheus error rate gate: abort if 5xx rate > 1%
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Check Prometheus error rate (abort if > 1%)"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          PROMETHEUS_URL="${globals.prometheus_url:-http://prometheus.monitoring.svc.cluster.local:9090}"
+
+          echo "Querying Prometheus for 5xx error rate over last 5 minutes..."
+
+          QUERY='sum(rate(istio_requests_total{reporter="destination",destination_service=~"study-platform.*",response_code=~"5.*"}[5m])) / sum(rate(istio_requests_total{reporter="destination",destination_service=~"study-platform.*"}[5m]))'
+
+          RESPONSE=$(curl -sf \
+            --max-time 15 \
+            "${PROMETHEUS_URL}/api/v1/query" \
+            --data-urlencode "query=${QUERY}")
+
+          if [ -z "${RESPONSE}" ]; then
+            echo "WARNING: Prometheus query returned empty response. Proceeding cautiously."
+            exit 0
+          fi
+
+          ERROR_RATE=$(echo "${RESPONSE}" | jq -r '.data.result[0].value[1] // "0"')
+          echo "Current 5xx error rate: ${ERROR_RATE} (threshold: 0.01)"
+
+          # Compare using bc for floating-point arithmetic
+          IS_HIGH=$(echo "${ERROR_RATE} > 0.01" | bc -l)
+
+          if [ "${IS_HIGH}" = "1" ]; then
+            RATE_PCT=$(echo "${ERROR_RATE} * 100" | bc -l | xargs printf "%.4f")
+            echo "ABORT: Error rate ${RATE_PCT}% exceeds 1% threshold."
+            echo "Triggering rollback via error handler..."
+            exit 1
+          fi
+
+          echo "Error rate within acceptable range. Proceeding to full rollout."
+
+    # -------------------------------------------------------------------------
+    # Step 6 — Full rollout: 100% traffic to v2
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Full rollout — 100% traffic to v2"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          echo "Shifting 100% of traffic to v2..."
+
+          kubectl patch virtualservice study-platform \
+            -n study-platform \
+            --context eks-test-2 \
+            --type merge \
+            -p '{
+              "spec": {
+                "http": [
+                  {
+                    "name": "full-rollout",
+                    "route": [
+                      {
+                        "destination": {
+                          "host": "study-platform",
+                          "subset": "v2"
+                        },
+                        "weight": 100
+                      }
+                    ],
+                    "timeout": "30s",
+                    "retries": {
+                      "attempts": 3,
+                      "perTryTimeout": "10s",
+                      "retryOn": "gateway-error,connect-failure,retriable-4xx"
+                    }
+                  }
+                ]
+              }
+            }'
+
+          echo "Full rollout complete. All traffic now routing to v2."
+
+    # -------------------------------------------------------------------------
+    # Step 7 — Chainsaw post-deploy validation tests
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Chainsaw post-deploy validation"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          echo "Running Chainsaw post-deploy tests against eks-test-2..."
+
+          chainsaw test \
+            --config /opt/chainsaw/chainsaw-config.yaml \
+            --test-dir /opt/chainsaw/tests/ \
+            --kubeconfig /opt/kubeconfig/eks-test-2 \
+            --parallel 4 \
+            --timeout 10m
+
+          echo "Chainsaw tests passed."
+
+    # -------------------------------------------------------------------------
+    # Step 8 — Log deploy complete
+    # -------------------------------------------------------------------------
+    - type: command
+      description: "Deploy complete"
+      configuration:
+        exec: |
+          echo "========================================"
+          echo "  PRODUCTION DEPLOY COMPLETE"
+          echo "========================================"
+          echo "  Description : ${option.description}"
+          echo "  Version     : ${option.version}"
+          echo "  Deployed by : ${job.username}"
+          echo "  Completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "========================================"
+
+  # ---------------------------------------------------------------------------
+  # Error handlers — run automatically on any step failure
+  # ---------------------------------------------------------------------------
+  errorhandlers:
+    - type: command
+      description: "Rollback on failure via ArgoCD"
+      configuration:
+        exec: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "  DEPLOY FAILED — INITIATING ROLLBACK"
+          echo "========================================"
+          echo "  Description : ${option.description}"
+          echo "  Version     : ${option.version}"
+          echo "  Failed step : ${job.stepnum}"
+          echo "  Timestamp   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Restore VirtualService to 100% v1 before ArgoCD rollback
+          kubectl patch virtualservice study-platform \
+            -n study-platform \
+            --context eks-test-2 \
+            --type merge \
+            -p '{
+              "spec": {
+                "http": [
+                  {
+                    "name": "rollback-traffic",
+                    "route": [
+                      {
+                        "destination": {
+                          "host": "study-platform",
+                          "subset": "v1"
+                        },
+                        "weight": 100
+                      }
+                    ]
+                  }
+                ]
+              }
+            }' || echo "WARNING: VirtualService patch failed — manual intervention may be needed."
+
+          # Roll back ArgoCD to previous healthy revision
+          argocd app rollback study-platform-test-2 \
+            --auth-token "${ARGOCD_TOKEN}" \
+            --server argocd.eks-ops.internal \
+            --grpc-web
+
+          echo "Rollback initiated. Verify application health in ArgoCD and Grafana."
+
+  # ---------------------------------------------------------------------------
+  # Notifications
+  # ---------------------------------------------------------------------------
+  notification:
+    onsuccess:
+      plugin:
+        type: slack-incoming-webhook
+        configuration:
+          webhook_url: "${globals.slack_webhook}"
+          message: |
+            *DEPLOY COMPLETE* :white_check_mark:
+            *Description:* ${option.description}
+            *Version:* ${option.version}
+            *Deployed by:* ${job.username}
+            *Duration:* ${job.execid}
+            *Cluster:* eks-test-2 (prod)
+            *Rundeck job:* <${globals.rundeck_url}/project/deployments/execution/show/${job.execid}|View execution>
+          channel: "#deployments"
+
+    onfailure:
+      plugin:
+        type: slack-incoming-webhook
+        configuration:
+          webhook_url: "${globals.slack_webhook}"
+          message: |
+            *DEPLOY FAILED* :x:
+            *Description:* ${option.description}
+            *Version:* ${option.version}
+            *Triggered by:* ${job.username}
+            *Failed at step:* ${job.stepnum}
+            *Cluster:* eks-test-2 (prod)
+            *Action required:* Rollback has been initiated automatically. Verify in ArgoCD.
+            *Rundeck job:* <${globals.rundeck_url}/project/deployments/execution/show/${job.execid}|View execution>
+          channel: "#deployments"

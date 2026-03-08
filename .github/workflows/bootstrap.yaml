@@ -1,0 +1,197 @@
+name: Bootstrap — Day-0 Cluster Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_clusters:
+        description: "Clusters to bootstrap (space-separated, e.g. 'eks-ops eks-test-1 eks-test-2')"
+        required: true
+        type: string
+        default: "eks-ops eks-test-1 eks-test-2"
+      dry_run:
+        description: "Run in dry-run mode (--check)"
+        required: false
+        type: boolean
+        default: false
+      skip_verify:
+        description: "Skip final verification step"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  bootstrap:
+    name: Day-0 Bootstrap
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: bootstrap-${{ github.run_id }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Ansible and dependencies
+        run: |
+          pip install --upgrade pip
+          pip install ansible boto3 botocore kubernetes openshift
+
+      - name: Install Ansible collections
+        run: |
+          ansible-galaxy collection install \
+            amazon.aws \
+            kubernetes.core \
+            community.general \
+            --force
+        working-directory: infra/ansible
+
+      - name: Configure kubeconfig for all clusters
+        run: |
+          for CLUSTER in ${{ inputs.target_clusters }}; do
+            aws eks update-kubeconfig \
+              --name "$CLUSTER" \
+              --region "${{ vars.AWS_REGION }}" \
+              --alias "$CLUSTER"
+            echo "Configured kubeconfig for $CLUSTER"
+          done
+
+      - name: Set Ansible extra args
+        id: ansible-args
+        run: |
+          EXTRA_ARGS=""
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            EXTRA_ARGS="$EXTRA_ARGS --check --diff"
+          fi
+          echo "extra_args=$EXTRA_ARGS" >> "$GITHUB_OUTPUT"
+
+      # ─── Step 01: Seed CA Certificates ──────────────────────────────────────
+      - name: "01 — Seed CA certificates"
+        working-directory: infra/ansible
+        run: |
+          ansible-playbook \
+            -i inventory/hosts.yaml \
+            playbooks/01-seed-cacerts.yaml \
+            --extra-vars "target_clusters='${{ inputs.target_clusters }}'" \
+            ${{ steps.ansible-args.outputs.extra_args }} \
+            -v
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_STDOUT_CALLBACK: yaml
+          KUBECONFIG: ~/.kube/config
+
+      # ─── Step 02: Install Istio ──────────────────────────────────────────────
+      - name: "02 — Install Istio (multi-primary)"
+        working-directory: infra/ansible
+        run: |
+          ansible-playbook \
+            -i inventory/hosts.yaml \
+            playbooks/02-install-istio.yaml \
+            --extra-vars "target_clusters='${{ inputs.target_clusters }}'" \
+            ${{ steps.ansible-args.outputs.extra_args }} \
+            -v
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_STDOUT_CALLBACK: yaml
+          KUBECONFIG: ~/.kube/config
+
+      # ─── Step 03: East-West Gateway ─────────────────────────────────────────
+      - name: "03 — Configure east-west gateway"
+        working-directory: infra/ansible
+        run: |
+          ansible-playbook \
+            -i inventory/hosts.yaml \
+            playbooks/03-east-west-gateway.yaml \
+            --extra-vars "target_clusters='${{ inputs.target_clusters }}'" \
+            ${{ steps.ansible-args.outputs.extra_args }} \
+            -v
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_STDOUT_CALLBACK: yaml
+          KUBECONFIG: ~/.kube/config
+
+      # ─── Step 04: Remote Secrets ─────────────────────────────────────────────
+      - name: "04 — Exchange remote secrets between clusters"
+        working-directory: infra/ansible
+        run: |
+          ansible-playbook \
+            -i inventory/hosts.yaml \
+            playbooks/04-remote-secrets.yaml \
+            --extra-vars "target_clusters='${{ inputs.target_clusters }}'" \
+            ${{ steps.ansible-args.outputs.extra_args }} \
+            -v
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_STDOUT_CALLBACK: yaml
+          KUBECONFIG: ~/.kube/config
+
+      # ─── Step 05: Register ArgoCD ────────────────────────────────────────────
+      - name: "05 — Register clusters in ArgoCD"
+        working-directory: infra/ansible
+        run: |
+          ansible-playbook \
+            -i inventory/hosts.yaml \
+            playbooks/05-register-argocd.yaml \
+            --extra-vars "target_clusters='${{ inputs.target_clusters }}'" \
+            ${{ steps.ansible-args.outputs.extra_args }} \
+            -v
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_STDOUT_CALLBACK: yaml
+          KUBECONFIG: ~/.kube/config
+
+      # ─── Step 06: Namespace Labels ───────────────────────────────────────────
+      - name: "06 — Apply namespace labels and policies"
+        working-directory: infra/ansible
+        run: |
+          ansible-playbook \
+            -i inventory/hosts.yaml \
+            playbooks/06-namespace-labels.yaml \
+            --extra-vars "target_clusters='${{ inputs.target_clusters }}'" \
+            ${{ steps.ansible-args.outputs.extra_args }} \
+            -v
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_STDOUT_CALLBACK: yaml
+          KUBECONFIG: ~/.kube/config
+
+      # ─── Step 07: Verification ───────────────────────────────────────────────
+      - name: "07 — Verify bootstrap (connectivity + health checks)"
+        if: inputs.skip_verify != true
+        working-directory: infra/ansible
+        run: |
+          ansible-playbook \
+            -i inventory/hosts.yaml \
+            playbooks/07-verify.yaml \
+            --extra-vars "target_clusters='${{ inputs.target_clusters }}'" \
+            -v
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_STDOUT_CALLBACK: yaml
+          KUBECONFIG: ~/.kube/config
+
+      - name: Bootstrap summary
+        if: always()
+        run: |
+          echo "## Bootstrap Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Parameter | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Clusters  | ${{ inputs.target_clusters }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Dry run   | ${{ inputs.dry_run }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered by | ${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Workflow run | ${{ github.run_id }} |" >> "$GITHUB_STEP_SUMMARY"

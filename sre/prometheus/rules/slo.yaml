@@ -1,0 +1,205 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: study-platform-slo
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kube-prometheus-stack
+    role: alert-rules
+    team: sre
+    app.kubernetes.io/part-of: study-platform
+spec:
+  groups:
+    # ---------------------------------------------------------------------------
+    # SLO: Availability
+    # Target: 99.5% (error budget = 0.5%)
+    # Burn rate math:
+    #   14.4x burn over 1h  → exhausts ~2% of monthly budget per hour
+    #    6.0x burn over 6h  → elevated but not yet critical
+    # ---------------------------------------------------------------------------
+    - name: slo.availability
+      interval: 30s
+      rules:
+        # Recording rule — used by dashboards and alert expressions
+        - record: slo:error_rate:ratio_rate5m
+          expr: |
+            sum(rate(istio_requests_total{response_code=~"5.*"}[5m]))
+            /
+            sum(rate(istio_requests_total[5m]))
+          labels:
+            slo: availability
+            service: study-platform
+
+        - record: slo:error_rate:ratio_rate1h
+          expr: |
+            sum(rate(istio_requests_total{response_code=~"5.*"}[1h]))
+            /
+            sum(rate(istio_requests_total[1h]))
+          labels:
+            slo: availability
+            service: study-platform
+
+        - record: slo:error_rate:ratio_rate6h
+          expr: |
+            sum(rate(istio_requests_total{response_code=~"5.*"}[6h]))
+            /
+            sum(rate(istio_requests_total[6h]))
+          labels:
+            slo: availability
+            service: study-platform
+
+        - record: slo:error_rate:ratio_rate30d
+          expr: |
+            sum(rate(istio_requests_total{response_code=~"5.*"}[30d]))
+            /
+            sum(rate(istio_requests_total[30d]))
+          labels:
+            slo: availability
+            service: study-platform
+
+        # Error budget remaining (1 = full budget, 0 = exhausted)
+        - record: slo:error_budget_remaining:ratio
+          expr: |
+            1 - (slo:error_rate:ratio_rate30d / 0.005)
+          labels:
+            slo: availability
+            service: study-platform
+
+        # ---------------------------------------------------------------------------
+        # P1 — Error budget burning at 14.4x for 1 hour
+        # This means ~2% of the monthly error budget consumed per hour.
+        # At this rate the full budget is exhausted in ~5 hours.
+        # Page immediately.
+        # ---------------------------------------------------------------------------
+        - alert: ErrorBudgetBurnRateCritical
+          expr: |
+            (
+              sum(rate(istio_requests_total{response_code=~"5.*"}[1h]))
+              /
+              sum(rate(istio_requests_total[1h]))
+            ) > (14.4 * 0.005)
+          for: 5m
+          labels:
+            severity: P1
+            team: sre
+            slo: availability
+            service: study-platform
+          annotations:
+            summary: "P1 — Error budget burning critically fast (14.4x)"
+            description: |
+              The error rate over the last 1h is {{ $value | humanizePercentage }},
+              which exceeds the 14.4x SLO burn rate threshold (target SLO error budget = 0.5%).
+              At this rate the full 30-day error budget will be exhausted within ~5 hours.
+              Immediate action required.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-high-error-rate.md"
+            dashboard: "https://grafana.internal/d/platform-slo/slo-error-budget"
+
+        # ---------------------------------------------------------------------------
+        # P2 — Error budget burning at 6x for 6 hours
+        # This means ~2.5% of the monthly error budget consumed per 6-hour window.
+        # Investigate within 1 hour.
+        # ---------------------------------------------------------------------------
+        - alert: ErrorBudgetBurnRateHigh
+          expr: |
+            (
+              sum(rate(istio_requests_total{response_code=~"5.*"}[6h]))
+              /
+              sum(rate(istio_requests_total[6h]))
+            ) > (6.0 * 0.005)
+          for: 30m
+          labels:
+            severity: P2
+            team: sre
+            slo: availability
+            service: study-platform
+          annotations:
+            summary: "P2 — Error budget burn rate elevated (6x over 6h)"
+            description: |
+              The 6h error rate is {{ $value | humanizePercentage }}, exceeding the
+              6x burn rate threshold. The 30-day error budget is being consumed faster
+              than expected. Investigate within 1 hour.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-high-error-rate.md"
+            dashboard: "https://grafana.internal/d/platform-slo/slo-error-budget"
+
+    # ---------------------------------------------------------------------------
+    # SLO: Latency
+    # Target: p95 < 500ms
+    # ---------------------------------------------------------------------------
+    - name: slo.latency
+      interval: 30s
+      rules:
+        # Recording rule — p95 latency over 5m window using Istio histogram
+        - record: slo:latency_p95:seconds_rate5m
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum(rate(istio_request_duration_milliseconds_bucket[5m])) by (le)
+            ) / 1000
+          labels:
+            slo: latency
+            service: study-platform
+            quantile: "0.95"
+
+        - record: slo:latency_p99:seconds_rate5m
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum(rate(istio_request_duration_milliseconds_bucket[5m])) by (le)
+            ) / 1000
+          labels:
+            slo: latency
+            service: study-platform
+            quantile: "0.99"
+
+        # ---------------------------------------------------------------------------
+        # P1 — p95 latency above 1.0s for 5 minutes
+        # Double the SLO target. Users experiencing severe degradation. Page immediately.
+        # ---------------------------------------------------------------------------
+        - alert: LatencyP95High
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum(rate(istio_request_duration_milliseconds_bucket[5m])) by (le)
+            ) / 1000 > 1.0
+          for: 5m
+          labels:
+            severity: P1
+            team: sre
+            slo: latency
+            service: study-platform
+          annotations:
+            summary: "P1 — p95 latency above 1.0s (SLO target: 500ms)"
+            description: |
+              The 95th percentile request latency is {{ $value | humanizeDuration }}
+              over the last 5 minutes, which exceeds the critical threshold of 1.0s
+              (2x the SLO target of 500ms). Users are experiencing significant delays.
+              Immediate investigation required.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-high-error-rate.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"
+
+        # ---------------------------------------------------------------------------
+        # P2 — p95 latency above 500ms for 15 minutes
+        # At SLO boundary. Sustained elevation may indicate upstream issue or
+        # resource saturation. Investigate within 1 hour.
+        # ---------------------------------------------------------------------------
+        - alert: LatencyP95Elevated
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum(rate(istio_request_duration_milliseconds_bucket[5m])) by (le)
+            ) / 1000 > 0.5
+          for: 15m
+          labels:
+            severity: P2
+            team: sre
+            slo: latency
+            service: study-platform
+          annotations:
+            summary: "P2 — p95 latency elevated above SLO target (500ms)"
+            description: |
+              The 95th percentile request latency is {{ $value | humanizeDuration }}
+              over the last 15 minutes, exceeding the SLO target of 500ms.
+              This has been sustained for 15 minutes. Investigate before it degrades further.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-high-error-rate.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"

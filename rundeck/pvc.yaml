@@ -1,0 +1,41 @@
+---
+# PVC for Rundeck execution logs, project definitions, and SSH keys.
+# Sized for log retention. Adjust if log volume grows significantly.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rundeck-logs-pvc
+  namespace: rundeck
+  labels:
+    app: rundeck
+    app.kubernetes.io/name: rundeck
+    app.kubernetes.io/component: storage
+    app.kubernetes.io/part-of: study-platform-ops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+# PVC for PostgreSQL data directory.
+# Sized for Rundeck job history, audit trail, and scheduled job metadata.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data-pvc
+  namespace: rundeck
+  labels:
+    app: postgres
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: storage
+    app.kubernetes.io/part-of: study-platform-ops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 10Gi

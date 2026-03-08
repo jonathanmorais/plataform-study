@@ -1,0 +1,12 @@
+---
+# Variables specific to the eks-test-2 (production) cluster.
+
+cluster_name: eks-test-2
+environment: production
+istio_network: network-test-2
+kubeconfig_context: "arn:aws:eks:{{ aws_region }}:{{ aws_account_id }}:cluster/eks-test-2"
+
+# ArgoCD sync policy for prod: manual sync only (Rundeck controls promotion)
+argocd_auto_sync: false
+argocd_prune: false
+argocd_self_heal: false

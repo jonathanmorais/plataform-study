@@ -1,0 +1,174 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: study-platform
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  description: "Study Platform — GitOps project for staging (eks-test-1) and prod (eks-test-2) deployments"
+
+  # Allow sync from any repository; lock down to your org URL in prod
+  sourceRepos:
+    - "https://github.com/YOUR_ORG/plataform-study.git"
+    - "https://github.com/YOUR_ORG/plataform-study"
+
+  destinations:
+    # eks-ops (ArgoCD hub / management cluster — in-cluster)
+    - server: https://kubernetes.default.svc
+      namespace: argocd
+    - server: https://kubernetes.default.svc
+      namespace: study-platform
+    - server: https://kubernetes.default.svc
+      namespace: istio-system
+    - server: https://kubernetes.default.svc
+      namespace: rundeck
+
+    # eks-test-1 (staging)
+    - server: https://EKS_TEST_1_API_ENDPOINT
+      namespace: study-platform
+    - server: https://EKS_TEST_1_API_ENDPOINT
+      namespace: istio-system
+
+    # eks-test-2 (prod)
+    - server: https://EKS_TEST_2_API_ENDPOINT
+      namespace: study-platform
+    - server: https://EKS_TEST_2_API_ENDPOINT
+      namespace: istio-system
+
+  # Cluster-scoped resources this project is allowed to manage
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRole
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRoleBinding
+    - group: "apiextensions.k8s.io"
+      kind: CustomResourceDefinition
+    - group: "admissionregistration.k8s.io"
+      kind: MutatingWebhookConfiguration
+    - group: "admissionregistration.k8s.io"
+      kind: ValidatingWebhookConfiguration
+    - group: "networking.istio.io"
+      kind: "*"
+    - group: "security.istio.io"
+      kind: "*"
+    - group: "policy"
+      kind: PodDisruptionBudget
+    - group: "autoscaling"
+      kind: HorizontalPodAutoscaler
+
+  # Namespace-scoped resources this project is allowed to manage
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: Secret
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ServiceAccount
+    - group: ""
+      kind: PersistentVolumeClaim
+    - group: "apps"
+      kind: Deployment
+    - group: "apps"
+      kind: StatefulSet
+    - group: "apps"
+      kind: DaemonSet
+    - group: "apps"
+      kind: ReplicaSet
+    - group: "autoscaling"
+      kind: HorizontalPodAutoscaler
+    - group: "policy"
+      kind: PodDisruptionBudget
+    - group: "networking.k8s.io"
+      kind: Ingress
+    - group: "networking.istio.io"
+      kind: VirtualService
+    - group: "networking.istio.io"
+      kind: DestinationRule
+    - group: "networking.istio.io"
+      kind: Gateway
+    - group: "networking.istio.io"
+      kind: ServiceEntry
+    - group: "security.istio.io"
+      kind: PeerAuthentication
+    - group: "security.istio.io"
+      kind: AuthorizationPolicy
+    - group: "rbac.authorization.k8s.io"
+      kind: Role
+    - group: "rbac.authorization.k8s.io"
+      kind: RoleBinding
+    - group: "batch"
+      kind: Job
+    - group: "batch"
+      kind: CronJob
+
+  # Namespace resource blacklist — never allow direct Secret deletion via ArgoCD sync
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: ResourceQuota
+
+  roles:
+    # Developer: can sync staging only, no prod, no project admin
+    - name: developer
+      description: "Feature branch developers — sync and view staging only"
+      policies:
+        - p, proj:study-platform:developer, applications, get,    study-platform/study-platform-test-1, allow
+        - p, proj:study-platform:developer, applications, sync,   study-platform/study-platform-test-1, allow
+        - p, proj:study-platform:developer, applications, action, study-platform/study-platform-test-1, allow
+        - p, proj:study-platform:developer, applications, get,    study-platform/study-platform-test-2, allow
+        # Cannot sync prod — Rundeck has the token for that
+        - p, proj:study-platform:developer, applications, sync,   study-platform/study-platform-test-2, deny
+      groups:
+        - "YOUR_ORG:developers"
+
+    # Senior Engineer: can sync both staging and prod (e.g. for hotfixes and incident deploys)
+    - name: senior-engineer
+      description: "Senior engineers — sync both staging and prod"
+      policies:
+        - p, proj:study-platform:senior-engineer, applications, get,    study-platform/*, allow
+        - p, proj:study-platform:senior-engineer, applications, sync,   study-platform/*, allow
+        - p, proj:study-platform:senior-engineer, applications, action, study-platform/*, allow
+        - p, proj:study-platform:senior-engineer, applications, delete, study-platform/*, deny
+      groups:
+        - "YOUR_ORG:senior-engineers"
+
+    # Platform Admin: full control over all apps in this project
+    - name: platform-admin
+      description: "Platform team — full access to all study-platform apps"
+      policies:
+        - p, proj:study-platform:platform-admin, applications, *, study-platform/*, allow
+        - p, proj:study-platform:platform-admin, repositories, *, *, allow
+        - p, proj:study-platform:platform-admin, clusters,      *, *, allow
+      groups:
+        - "YOUR_ORG:platform-team"
+
+  # Sync windows — block ad-hoc syncs on prod during business hours
+  # Engineers must use Rundeck for scheduled deploys; only allow syncs
+  # outside business hours or via the maintenance window.
+  syncWindows:
+    # Always allow staging to sync (ArgoCD auto-sync drives it)
+    - kind: allow
+      schedule: "* * * * *"
+      duration: 24h
+      applications:
+        - "study-platform-test-1"
+      manualSync: true
+
+    # Prod: deny automated syncs at all times — Rundeck triggers manually
+    - kind: deny
+      schedule: "* * * * *"
+      duration: 24h
+      applications:
+        - "study-platform-test-2"
+      manualSync: false   # manual syncs (from Rundeck ArgoCD token) are still allowed
+
+  orphanedResources:
+    warn: true
+    ignore:
+      - group: ""
+        kind: ConfigMap
+        name: kube-root-ca.crt

@@ -1,0 +1,274 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - develop
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  test:
+    name: Full Test Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Run Node tests (if applicable)
+        run: |
+          if [[ -f package.json ]]; then
+            npm ci
+            npm run lint --if-present
+            npm test --if-present
+          fi
+
+      - name: Run Python tests (if applicable)
+        run: |
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+            pip install ruff pytest pytest-cov
+            ruff check . --select E,W,F --ignore E501
+            pytest --tb=short -q
+          fi
+
+      - name: Run Go tests (if applicable)
+        run: |
+          if [[ -f go.mod ]]; then
+            go build ./...
+            go test ./... -cover
+          fi
+
+  calculate-version:
+    name: Calculate Next Semver
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      version: ${{ steps.semver.outputs.version }}
+      tag: ${{ steps.semver.outputs.tag }}
+      bump: ${{ steps.semver.outputs.bump }}
+      changelog: ${{ steps.semver.outputs.changelog }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest tag
+        id: latest-tag
+        run: |
+          LATEST=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          if [[ -z "$LATEST" ]]; then
+            LATEST="v0.0.0"
+          fi
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest tag: $LATEST"
+
+      - name: Calculate version bump from conventional commits
+        id: semver
+        run: |
+          LATEST_TAG="${{ steps.latest-tag.outputs.tag }}"
+
+          # Parse current version
+          VERSION="${LATEST_TAG#v}"
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+
+          # Get commits since last tag
+          if [[ "$LATEST_TAG" == "v0.0.0" ]]; then
+            COMMITS=$(git log --pretty=format:"%s" HEAD)
+          else
+            COMMITS=$(git log --pretty=format:"%s" "${LATEST_TAG}..HEAD")
+          fi
+
+          BUMP="none"
+          CHANGELOG=""
+
+          # Detect bump level from conventional commits
+          # Priority: major > minor > patch > none
+          while IFS= read -r commit; do
+            CHANGELOG="$CHANGELOG\n- $commit"
+            if echo "$commit" | grep -qE '^feat(\(.+\))?!:|^fix(\(.+\))?!:|BREAKING CHANGE'; then
+              BUMP="major"
+            elif echo "$commit" | grep -qE '^feat(\(.+\))?:' && [[ "$BUMP" != "major" ]]; then
+              BUMP="minor"
+            elif echo "$commit" | grep -qE '^fix(\(.+\))?:' && [[ "$BUMP" != "major" && "$BUMP" != "minor" ]]; then
+              BUMP="patch"
+            fi
+            # chore/docs/ci/style/refactor/test → no bump
+          done <<< "$COMMITS"
+
+          # Apply bump
+          case "$BUMP" in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+            none)
+              echo "No releasable commits found. Skipping release."
+              echo "version=skip" >> "$GITHUB_OUTPUT"
+              echo "tag=skip" >> "$GITHUB_OUTPUT"
+              echo "bump=none" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          NEW_TAG="v${NEW_VERSION}"
+
+          echo "Bump type: $BUMP"
+          echo "New version: $NEW_TAG"
+
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+          {
+            echo "changelog<<EOF"
+            printf '%b' "$CHANGELOG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: calculate-version
+    if: needs.calculate-version.outputs.bump != 'none' && needs.calculate-version.outputs.tag != 'skip'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create and push tag
+        run: |
+          git tag -a "${{ needs.calculate-version.outputs.tag }}" \
+            -m "Release ${{ needs.calculate-version.outputs.tag }}"
+          git push origin "${{ needs.calculate-version.outputs.tag }}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ needs.calculate-version.outputs.tag }}" \
+            --title "Release ${{ needs.calculate-version.outputs.tag }}" \
+            --notes "$(cat <<'NOTES'
+          ## What's Changed
+
+          ${{ needs.calculate-version.outputs.changelog }}
+
+          **Bump type:** ${{ needs.calculate-version.outputs.bump }}
+          **Commit:** ${{ github.sha }}
+          NOTES
+          )" \
+            --target develop
+
+  open-pr-to-main:
+    name: Open PR develop → main
+    runs-on: ubuntu-latest
+    needs: create-release
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Open pull request develop → main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if a PR already exists
+          EXISTING_PR=$(gh pr list \
+            --base main \
+            --head develop \
+            --state open \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+
+          if [[ -n "$EXISTING_PR" ]]; then
+            echo "PR #$EXISTING_PR already exists for develop → main. Updating..."
+            gh pr edit "$EXISTING_PR" \
+              --title "Release ${{ needs.calculate-version.outputs.tag }}: develop → main" \
+              --body "$(cat <<'BODY'
+          ## Release ${{ needs.calculate-version.outputs.tag }}
+
+          This PR promotes the develop branch to main after a successful release.
+
+          **Version bump:** ${{ needs.calculate-version.outputs.bump }}
+          **Tag created:** ${{ needs.calculate-version.outputs.tag }}
+
+          ### Changelog
+          ${{ needs.calculate-version.outputs.changelog }}
+
+          ---
+          *Created automatically by the release workflow.*
+          BODY
+          )"
+          else
+            gh pr create \
+              --base main \
+              --head develop \
+              --title "Release ${{ needs.calculate-version.outputs.tag }}: develop → main" \
+              --body "$(cat <<'BODY'
+          ## Release ${{ needs.calculate-version.outputs.tag }}
+
+          This PR promotes the develop branch to main after a successful release.
+
+          **Version bump:** ${{ needs.calculate-version.outputs.bump }}
+          **Tag created:** ${{ needs.calculate-version.outputs.tag }}
+
+          ### Changelog
+          ${{ needs.calculate-version.outputs.changelog }}
+
+          ---
+          *Created automatically by the release workflow.*
+          BODY
+          )"
+          fi

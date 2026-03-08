@@ -1,0 +1,389 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+  namespace: monitoring
+  labels:
+    app: promtail
+    app.kubernetes.io/part-of: loki-stack
+    team: sre
+data:
+  promtail.yaml: |
+    # ---------------------------------------------------------------------------
+    # Promtail configuration for study-platform
+    # Deployed as a DaemonSet on eks-test-1 (staging) and eks-test-2 (prod).
+    # Collects: Kubernetes pod logs, systemd journal, Istio access logs.
+    # ---------------------------------------------------------------------------
+
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+      log_level: info
+      log_format: json
+
+    # ---------------------------------------------------------------------------
+    # Positions file — tracks which log offsets have been read.
+    # Must survive pod restarts to avoid re-ingesting old logs.
+    # ---------------------------------------------------------------------------
+    positions:
+      filename: /tmp/positions.yaml
+      sync_period: 10s
+
+    # ---------------------------------------------------------------------------
+    # Loki push endpoint
+    # The monitoring namespace hosts the Loki StatefulSet.
+    # ---------------------------------------------------------------------------
+    clients:
+      - url: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
+        tenant_id: study-platform
+        batchwait: 1s
+        batchsize: 1048576
+        timeout: 10s
+        backoff_config:
+          min_period: 500ms
+          max_period: 5m
+          max_retries: 10
+        external_labels:
+          cluster: ${CLUSTER_NAME}
+          environment: ${ENVIRONMENT}
+
+    # ---------------------------------------------------------------------------
+    # Scrape configurations
+    # ---------------------------------------------------------------------------
+    scrape_configs:
+
+      # -------------------------------------------------------------------------
+      # 1. Kubernetes pods — all namespaces
+      # Discovers pods via the Kubernetes API and reads logs from
+      # /var/log/pods/<namespace>_<pod>_<uid>/<container>/*.log
+      # -------------------------------------------------------------------------
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: []  # empty = all namespaces
+
+        # Relabeling: map Kubernetes metadata to Loki labels
+        relabel_configs:
+          # Only scrape pods with the annotation promtail.io/scrape: "true"
+          # OR pods in the study-platform namespace (always scrape)
+          - source_labels: [__meta_kubernetes_pod_annotation_promtail_io_scrape]
+            action: keep
+            regex: "true"
+
+          - source_labels: [__meta_kubernetes_namespace]
+            action: keep
+            regex: "study-platform|monitoring|istio-system|argocd|rundeck"
+
+          # Map namespace to label
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+
+          # Map pod name to label
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+          # Map container name to label
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            target_label: container
+
+          # Map app label (app or app.kubernetes.io/name)
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+            regex: (.+)
+
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            target_label: app
+            regex: (.+)
+
+          # Map node to label
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+
+          # Map deployment/statefulset label
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            target_label: component
+            regex: (.+)
+
+          # Construct the path to the log file
+          - source_labels:
+              - __meta_kubernetes_pod_uid
+              - __meta_kubernetes_pod_container_name
+            target_label: __path__
+            separator: /
+            replacement: /var/log/pods/*$1*/$2/*.log
+
+          # Set multiline=false for containers that don't use multiline logs
+          - source_labels: [__meta_kubernetes_pod_annotation_promtail_io_multiline]
+            target_label: __multiline__
+            regex: (.+)
+
+        # Pipeline stages: parse structured JSON logs from app containers
+        pipeline_stages:
+          # Try JSON parsing first (structured logs)
+          - match:
+              selector: '{namespace="study-platform"}'
+              stages:
+                - json:
+                    expressions:
+                      level: level
+                      msg: msg
+                      time: time
+                      trace_id: trace_id
+                      span_id: span_id
+                      request_id: request_id
+                      user_id: user_id
+                      http_method: http_method
+                      http_path: http_path
+                      http_status: http_status
+                      duration_ms: duration_ms
+                      error: error
+
+                # Extract labels from structured fields for indexed querying
+                - labels:
+                    level:
+                    trace_id:
+                    http_method:
+                    http_status:
+
+                # Drop debug logs in production to reduce log volume
+                - match:
+                    selector: '{namespace="study-platform"}'
+                    stages:
+                      - drop:
+                          expression: '"level":"debug"'
+                          # Only drop debug in prod cluster — staging keeps them
+                          # This is overridden per environment via env var in DaemonSet
+
+                # Normalize timestamp from application log
+                - timestamp:
+                    source: time
+                    format: RFC3339Nano
+                    fallback_formats:
+                      - "2006-01-02T15:04:05.999999999Z07:00"
+                      - "2006-01-02 15:04:05"
+
+          # ArgoCD logs — plain text with Go log format
+          - match:
+              selector: '{namespace="argocd"}'
+              stages:
+                - regex:
+                    expression: '^(?P<time>\S+)\s+(?P<level>\w+)\s+(?P<msg>.+)$'
+                - labels:
+                    level:
+                - timestamp:
+                    source: time
+                    format: RFC3339
+
+      # -------------------------------------------------------------------------
+      # 2. Istio sidecar proxy (Envoy) access logs
+      # Istio access logs are written to /var/log/pods in JSON format when
+      # the mesh is configured with accessLogFile: /dev/stdout
+      # We separate istio-proxy container logs for specific pipeline processing.
+      # -------------------------------------------------------------------------
+      - job_name: istio-proxy-access-logs
+        kubernetes_sd_configs:
+          - role: pod
+
+        relabel_configs:
+          # Only scrape istio-proxy container
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            action: keep
+            regex: "istio-proxy"
+
+          - source_labels: [__meta_kubernetes_namespace]
+            action: keep
+            regex: "study-platform|monitoring"
+
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+            regex: (.+)
+
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+
+          - source_labels:
+              - __meta_kubernetes_pod_uid
+              - __meta_kubernetes_pod_container_name
+            target_label: __path__
+            separator: /
+            replacement: /var/log/pods/*$1*/$2/*.log
+
+        pipeline_stages:
+          # Parse Istio JSON access log format
+          - json:
+              expressions:
+                method: method
+                path: path
+                protocol: protocol
+                response_code: response_code
+                response_flags: response_flags
+                bytes_sent: bytes_sent
+                duration: duration
+                upstream_host: upstream_host
+                upstream_cluster: upstream_cluster
+                x_forwarded_for: x_forwarded_for
+                user_agent: user_agent
+                request_id: request_id
+                authority: authority
+                upstream_service_time: upstream_service_time
+                route_name: route_name
+                downstream_remote_address: downstream_remote_address
+                connection_termination_details: connection_termination_details
+
+          # Extract key labels
+          - labels:
+              method:
+              path:
+              response_code:
+              response_flags:
+              upstream_cluster:
+
+          # Drop health check logs to reduce noise
+          - drop:
+              expression: '"path":"/healthz"'
+          - drop:
+              expression: '"path":"/readyz"'
+          - drop:
+              expression: '"path":"/metrics"'
+
+      # -------------------------------------------------------------------------
+      # 3. Systemd journal — node-level logs
+      # Captures kubelet, containerd, and kernel messages from each node.
+      # Useful for diagnosing OOM kills, node startup failures, and cgroup issues.
+      # -------------------------------------------------------------------------
+      - job_name: systemd-journal
+        journal:
+          max_age: 12h
+          path: /var/log/journal
+          labels:
+            job: systemd-journal
+
+        relabel_configs:
+          # Only keep important systemd units
+          - source_labels: [__journal__systemd_unit]
+            action: keep
+            regex: "kubelet.service|containerd.service|docker.service|sshd.service|node_exporter.service"
+
+          - source_labels: [__journal__systemd_unit]
+            target_label: unit
+
+          - source_labels: [__journal__hostname]
+            target_label: node
+
+          - source_labels: [__journal_priority_keyword]
+            target_label: level
+
+        pipeline_stages:
+          # Add cluster label from environment
+          - static_labels:
+              log_type: systemd
+
+          # Parse kernel OOM messages
+          - match:
+              selector: '{unit="kubelet.service"}'
+              stages:
+                - regex:
+                    expression: '(?P<level>E|W|I)\d+\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d+)\s+(?P<msg>.+)'
+                - labels:
+                    level:
+
+      # -------------------------------------------------------------------------
+      # 4. Istio control plane logs (istiod)
+      # -------------------------------------------------------------------------
+      - job_name: istiod-logs
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [istio-system]
+
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: "istiod"
+
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            action: drop
+            regex: "istio-proxy"
+
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+          - source_labels:
+              - __meta_kubernetes_pod_uid
+              - __meta_kubernetes_pod_container_name
+            target_label: __path__
+            separator: /
+            replacement: /var/log/pods/*$1*/$2/*.log
+
+        pipeline_stages:
+          - static_labels:
+              component: istiod
+              log_type: control-plane
+
+          - json:
+              expressions:
+                level: level
+                msg: msg
+                time: time
+                error: error
+
+          - labels:
+              level:
+
+          - timestamp:
+              source: time
+              format: RFC3339Nano
+
+      # -------------------------------------------------------------------------
+      # 5. East-West Gateway logs
+      # -------------------------------------------------------------------------
+      - job_name: eastwest-gateway-logs
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [istio-system]
+
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: "istio-eastwestgateway"
+
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+          - source_labels:
+              - __meta_kubernetes_pod_uid
+              - __meta_kubernetes_pod_container_name
+            target_label: __path__
+            separator: /
+            replacement: /var/log/pods/*$1*/$2/*.log
+
+        pipeline_stages:
+          - static_labels:
+              component: eastwest-gateway
+              log_type: mesh-gateway
+
+          - json:
+              expressions:
+                method: method
+                path: path
+                response_code: response_code
+                upstream_cluster: upstream_cluster
+                duration: duration
+
+          - labels:
+              response_code:
+              upstream_cluster:

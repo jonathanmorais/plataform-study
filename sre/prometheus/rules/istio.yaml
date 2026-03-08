@@ -1,0 +1,318 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: study-platform-istio
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kube-prometheus-stack
+    role: alert-rules
+    team: sre
+    app.kubernetes.io/part-of: study-platform
+spec:
+  groups:
+    # ---------------------------------------------------------------------------
+    # Istio Control Plane Health
+    # ---------------------------------------------------------------------------
+    - name: istio.control_plane
+      interval: 30s
+      rules:
+        # Recording rule — istiod replica availability ratio
+        - record: istio:istiod_ready_ratio
+          expr: |
+            sum(kube_deployment_status_replicas_ready{namespace="istio-system", deployment=~"istiod.*"})
+            /
+            sum(kube_deployment_status_replicas{namespace="istio-system", deployment=~"istiod.*"})
+
+        # Recording rule — pilot push latency p99
+        - record: istio:pilot_push_latency_p99
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum(rate(pilot_proxy_convergence_time_bucket[5m])) by (le)
+            )
+
+        # Recording rule — xDS active connections
+        - record: istio:xds_active_connections
+          expr: |
+            sum(envoy_cluster_upstream_cx_active{cluster_name="xds-grpc"})
+
+        # ---------------------------------------------------------------------------
+        # P1 — istiod is absent
+        # If istiod disappears, the mesh's control plane is gone. New pod starts will
+        # not get a sidecar cert. Existing connections persist briefly via SPIFFE certs
+        # but the mesh is degraded. Page immediately.
+        # ---------------------------------------------------------------------------
+        - alert: IstiodDown
+          expr: |
+            absent(up{job="istiod", namespace="istio-system"} == 1)
+          for: 2m
+          labels:
+            severity: P1
+            team: sre
+            component: istio-control-plane
+          annotations:
+            summary: "P1 — Istiod is unreachable / absent"
+            description: |
+              No healthy istiod instance has been scraped for 2 minutes.
+              The Istio control plane is down. mTLS certificate issuance is stopped.
+              Existing connections will continue briefly until cert rotation fails.
+              New pod starts will not receive sidecar injection.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-istiod-down.md"
+            dashboard: "https://grafana.internal/d/istio-mesh/istio-mesh"
+
+        # ---------------------------------------------------------------------------
+        # P2 — istiod memory above 1 GB
+        # High memory in istiod can indicate too many CDS/EDS updates or a leak.
+        # Monitor and restart during low-traffic window if sustained.
+        # ---------------------------------------------------------------------------
+        - alert: IstiodHighMemory
+          expr: |
+            process_resident_memory_bytes{job="istiod", namespace="istio-system"}
+            > 1073741824
+          for: 10m
+          labels:
+            severity: P2
+            team: sre
+            component: istio-control-plane
+          annotations:
+            summary: "P2 — Istiod memory above 1 GB"
+            description: |
+              Istiod on pod {{ $labels.pod }} has resident memory
+              {{ $value | humanize1024 }}B, which exceeds 1 GB for 10 minutes.
+              This may indicate a memory leak or an excessive number of Envoy proxies
+              pushing xDS updates. Check the number of connected proxies and recent
+              configuration changes.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-istiod-down.md"
+            dashboard: "https://grafana.internal/d/istio-mesh/istio-mesh"
+
+        # P2 — xDS push errors elevated
+        - alert: IstiodXdsPushErrors
+          expr: |
+            sum(rate(pilot_xds_push_errors[5m])) > 0.1
+          for: 5m
+          labels:
+            severity: P2
+            team: sre
+            component: istio-control-plane
+          annotations:
+            summary: "P2 — Istiod xDS push errors elevated"
+            description: |
+              Istiod is experiencing {{ $value | humanize }} xDS push errors per second
+              over the last 5 minutes. Proxies may be receiving stale configuration.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-istiod-down.md"
+            dashboard: "https://grafana.internal/d/istio-mesh/istio-mesh"
+
+    # ---------------------------------------------------------------------------
+    # East-West Gateway Health
+    # Cross-cluster traffic between eks-test-1 and eks-test-2 flows through
+    # the east-west gateways. If these are down, cross-cluster calls fail silently.
+    # ---------------------------------------------------------------------------
+    - name: istio.east_west_gateway
+      interval: 30s
+      rules:
+        # Recording rule — east-west gateway throughput (bytes/s in+out)
+        - record: istio:eastwest_gateway_throughput_bytes
+          expr: |
+            sum(rate(istio_tcp_sent_bytes_total{app="istio-eastwestgateway"}[5m]))
+            +
+            sum(rate(istio_tcp_received_bytes_total{app="istio-eastwestgateway"}[5m]))
+
+        # Recording rule — east-west gateway connection rate
+        - record: istio:eastwest_gateway_connection_rate
+          expr: |
+            sum(rate(istio_tcp_connections_opened_total{app="istio-eastwestgateway"}[5m]))
+
+        # ---------------------------------------------------------------------------
+        # P1 — East-West Gateway pods absent
+        # Without east-west gateways, cross-cluster routing is broken.
+        # eks-test-1 cannot reach eks-test-2 services and vice versa.
+        # ---------------------------------------------------------------------------
+        - alert: EastWestGatewayDown
+          expr: |
+            absent(up{app="istio-eastwestgateway", namespace="istio-system"} == 1)
+          for: 2m
+          labels:
+            severity: P1
+            team: sre
+            component: istio-eastwest-gateway
+          annotations:
+            summary: "P1 — East-West gateway is absent / unreachable"
+            description: |
+              No healthy east-west gateway pod has been scraped for 2 minutes.
+              Cross-cluster service communication between eks-test-1 and eks-test-2
+              is broken or degraded. Multi-cluster traffic routing is impaired.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P2-east-west-gateway.md"
+            dashboard: "https://grafana.internal/d/istio-mesh/istio-mesh"
+
+        # P2 — East-West Gateway error rate high
+        - alert: EastWestGatewayErrorRateHigh
+          expr: |
+            (
+              sum(rate(istio_requests_total{app="istio-eastwestgateway", response_code=~"5.*"}[5m]))
+              /
+              sum(rate(istio_requests_total{app="istio-eastwestgateway"}[5m]))
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: P2
+            team: sre
+            component: istio-eastwest-gateway
+          annotations:
+            summary: "P2 — East-West gateway error rate above 5%"
+            description: |
+              The east-west gateway is returning {{ $value | humanizePercentage }} errors
+              over the last 5 minutes. Cross-cluster calls may be failing.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P2-east-west-gateway.md"
+            dashboard: "https://grafana.internal/d/istio-mesh/istio-mesh"
+
+    # ---------------------------------------------------------------------------
+    # mTLS Health
+    # ---------------------------------------------------------------------------
+    - name: istio.mtls
+      interval: 30s
+      rules:
+        # Recording rule — mTLS success ratio (connections using TLS vs total)
+        - record: istio:mtls_success_ratio
+          expr: |
+            sum(
+              rate(
+                istio_requests_total{
+                  connection_security_policy="mutual_tls"
+                }[5m]
+              )
+            )
+            /
+            sum(rate(istio_requests_total[5m]))
+
+        # Recording rule — mTLS failure rate (plaintext connections in strict namespace)
+        - record: istio:mtls_failure_rate
+          expr: |
+            sum(
+              rate(
+                istio_requests_total{
+                  connection_security_policy!="mutual_tls",
+                  destination_service_namespace="study-platform"
+                }[5m]
+              )
+            )
+            /
+            sum(
+              rate(
+                istio_requests_total{
+                  destination_service_namespace="study-platform"
+                }[5m]
+              )
+            )
+
+        # ---------------------------------------------------------------------------
+        # P2 — mTLS failure rate above 1%
+        # In STRICT mode, plaintext connections should be rejected at the proxy level.
+        # A non-trivial mTLS failure rate may indicate:
+        #   - A service not enrolled in the mesh (missing sidecar)
+        #   - A PeerAuthentication misconfiguration
+        #   - An attempted plaintext injection (security concern)
+        # ---------------------------------------------------------------------------
+        - alert: MtlsFailureRateHigh
+          expr: |
+            (
+              sum(
+                rate(
+                  istio_requests_total{
+                    connection_security_policy!="mutual_tls",
+                    destination_service_namespace="study-platform"
+                  }[5m]
+                )
+              )
+              /
+              sum(
+                rate(
+                  istio_requests_total{
+                    destination_service_namespace="study-platform"
+                  }[5m]
+                )
+              )
+            ) > 0.01
+          for: 5m
+          labels:
+            severity: P2
+            team: sre
+            component: istio-mtls
+          annotations:
+            summary: "P2 — mTLS failure/plaintext rate above 1% in study-platform namespace"
+            description: |
+              {{ $value | humanizePercentage }} of requests to services in the
+              study-platform namespace are NOT using mutual TLS. In STRICT mode this
+              should be 0%. Possible causes: unhealthy sidecar, missing istio-injection
+              label, or PeerAuthentication policy downgrade.
+              Source pod: {{ $labels.source_workload }} → Destination: {{ $labels.destination_service }}
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-istiod-down.md"
+            dashboard: "https://grafana.internal/d/istio-mesh/istio-mesh"
+
+        # P2 — mTLS overall success rate drops below 99.9%
+        - alert: MtlsSuccessRateLow
+          expr: |
+            istio:mtls_success_ratio < 0.999
+          for: 5m
+          labels:
+            severity: P2
+            team: sre
+            component: istio-mtls
+          annotations:
+            summary: "P2 — Mesh-wide mTLS success rate below 99.9%"
+            description: |
+              The mesh-wide mTLS success ratio is {{ $value | humanizePercentage }},
+              below the SLO target of 99.9%. Investigate which workloads are falling
+              back to plaintext or experiencing certificate errors.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-istiod-down.md"
+            dashboard: "https://grafana.internal/d/istio-mesh/istio-mesh"
+
+    # ---------------------------------------------------------------------------
+    # Istio Mesh Connectivity
+    # ---------------------------------------------------------------------------
+    - name: istio.mesh_connectivity
+      interval: 60s
+      rules:
+        # Recording rule — cross-cluster request rate (eks-test-1 → eks-test-2)
+        - record: istio:cross_cluster_request_rate
+          expr: |
+            sum by (source_cluster, destination_cluster) (
+              rate(
+                istio_requests_total{
+                  source_cluster!="",
+                  destination_cluster!="",
+                  source_cluster!=destination_cluster
+                }[5m]
+              )
+            )
+
+        # Recording rule — per-cluster error rate
+        - record: istio:cluster_error_rate
+          expr: |
+            sum by (destination_cluster) (
+              rate(istio_requests_total{response_code=~"5.*"}[5m])
+            )
+            /
+            sum by (destination_cluster) (
+              rate(istio_requests_total[5m])
+            )
+
+        # P2 — cross-cluster traffic dropped to zero (expected to be > 0 in normal ops)
+        - alert: CrossClusterTrafficAbsent
+          expr: |
+            absent(
+              istio:cross_cluster_request_rate > 0
+            )
+          for: 10m
+          labels:
+            severity: P2
+            team: sre
+            component: istio-cross-cluster
+          annotations:
+            summary: "P2 — No cross-cluster traffic detected for 10 minutes"
+            description: |
+              No cross-cluster requests have been recorded between eks-test-1 and
+              eks-test-2 for 10 minutes. This may indicate east-west gateway failure,
+              ServiceEntry misconfiguration, or network peering issues.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P2-east-west-gateway.md"
+            dashboard: "https://grafana.internal/d/istio-mesh/istio-mesh"

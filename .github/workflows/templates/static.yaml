@@ -1,0 +1,258 @@
+name: Static Site — CI/CD Template (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: "Application name"
+        required: true
+        type: string
+      ecr-repo:
+        description: "Full ECR repository URI"
+        required: true
+        type: string
+      framework:
+        description: "Static site framework: nextjs, hugo, vite, or generic"
+        required: false
+        type: string
+        default: "nextjs"
+      node-version:
+        description: "Node.js version (used for nextjs/vite/generic)"
+        required: false
+        type: string
+        default: "20"
+      hugo-version:
+        description: "Hugo version (used only when framework=hugo)"
+        required: false
+        type: string
+        default: "0.126.1"
+      build-output-dir:
+        description: "Directory where the build output is placed (e.g. out, public, dist)"
+        required: false
+        type: string
+        default: "out"
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+      GITOPS_REPO_TOKEN:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build:
+    name: Build — ${{ inputs.framework }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive  # Required for Hugo themes
+          fetch-depth: 0
+
+      # ─── Next.js / Vite / Generic Node build ────────────────────────────────
+      - name: Setup Node.js ${{ inputs.node-version }}
+        if: inputs.framework != 'hugo'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install Node dependencies
+        if: inputs.framework != 'hugo'
+        run: npm ci
+
+      - name: Build — Next.js
+        if: inputs.framework == 'nextjs'
+        run: npm run build
+        env:
+          NODE_ENV: production
+          NEXT_TELEMETRY_DISABLED: "1"
+
+      - name: Build — Vite
+        if: inputs.framework == 'vite'
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Build — Generic Node
+        if: inputs.framework == 'generic'
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      # ─── Hugo build ──────────────────────────────────────────────────────────
+      - name: Setup Hugo ${{ inputs.hugo-version }}
+        if: inputs.framework == 'hugo'
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: ${{ inputs.hugo-version }}
+          extended: true
+
+      - name: Build — Hugo
+        if: inputs.framework == 'hugo'
+        run: hugo --minify --gc
+        env:
+          HUGO_ENVIRONMENT: production
+
+      # ─── Upload build artifact ───────────────────────────────────────────────
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-build-${{ inputs.app-name }}-${{ github.sha }}
+          path: ${{ inputs.build-output-dir }}/
+          retention-days: 3
+
+  build-and-deploy:
+    name: Build Docker Image & GitOps Update
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: build-${{ inputs.app-name }}-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve target cluster, overlay and environment
+        id: resolve-target
+        run: |
+          REF="${{ github.ref }}"
+          BRANCH="${REF#refs/heads/}"
+
+          if [[ "$BRANCH" == feature/* ]]; then
+            CLUSTER="eks-test-1"
+            OVERLAY="test-1"
+            ENVIRONMENT="staging"
+          elif [[ "$BRANCH" == incidente/* ]]; then
+            CLUSTER="eks-test-1 eks-test-2"
+            OVERLAY="test-1 test-2"
+            ENVIRONMENT="incident"
+          elif [[ "$BRANCH" == "main" ]]; then
+            CLUSTER="eks-test-2"
+            OVERLAY="test-2"
+            ENVIRONMENT="production"
+          else
+            CLUSTER=""
+            OVERLAY=""
+            ENVIRONMENT="none"
+          fi
+
+          echo "cluster=$CLUSTER"         >> "$GITHUB_OUTPUT"
+          echo "overlay=$OVERLAY"         >> "$GITHUB_OUTPUT"
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+
+      # Rebuild for Docker context (Hugo/Next.js output needed in image)
+      - name: Setup Node.js (rebuild for Docker)
+        if: inputs.framework != 'hugo'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install and build (pre-Docker)
+        if: inputs.framework != 'hugo'
+        run: |
+          npm ci
+          npm run build
+        env:
+          NODE_ENV: production
+          NEXT_TELEMETRY_DISABLED: "1"
+
+      - name: Setup Hugo (rebuild for Docker)
+        if: inputs.framework == 'hugo'
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: ${{ inputs.hugo-version }}
+          extended: true
+
+      - name: Build Hugo (pre-Docker)
+        if: inputs.framework == 'hugo'
+        run: hugo --minify --gc
+        env:
+          HUGO_ENVIRONMENT: production
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ inputs.ecr-repo }}:${{ env.IMAGE_TAG }}
+            ${{ inputs.ecr-repo }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_NAME=${{ inputs.app-name }}
+            GIT_SHA=${{ github.sha }}
+            FRAMEWORK=${{ inputs.framework }}
+            BUILD_OUTPUT_DIR=${{ inputs.build-output-dir }}
+
+      - name: Clone GitOps repository
+        if: steps.resolve-target.outputs.environment != 'none'
+        run: |
+          git clone \
+            "https://x-access-token:${{ secrets.GITOPS_REPO_TOKEN }}@github.com/${{ vars.GITOPS_REPO }}.git" \
+            gitops-repo
+          cd gitops-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update kustomization overlays
+        if: steps.resolve-target.outputs.environment != 'none'
+        run: |
+          cd gitops-repo
+          OVERLAYS="${{ steps.resolve-target.outputs.overlay }}"
+          APP="${{ inputs.app-name }}"
+
+          for OVERLAY in $OVERLAYS; do
+            KUSTOMIZE_FILE="apps/${APP}/overlays/${OVERLAY}/kustomization.yaml"
+            if [[ ! -f "$KUSTOMIZE_FILE" ]]; then
+              echo "WARNING: $KUSTOMIZE_FILE not found, skipping overlay $OVERLAY"
+              continue
+            fi
+            yq e -i \
+              "(.images[] | select(.name == \"${{ inputs.ecr-repo }}\")).newTag = \"${{ env.IMAGE_TAG }}\"" \
+              "$KUSTOMIZE_FILE"
+            git add "$KUSTOMIZE_FILE"
+          done
+
+      - name: Commit and push GitOps changes
+        if: steps.resolve-target.outputs.environment != 'none'
+        run: |
+          cd gitops-repo
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          BRANCH_NAME="app/${{ inputs.app-name }}/${{ github.sha }}"
+          git checkout -b "$BRANCH_NAME"
+          git commit -m "chore(${{ inputs.app-name }}): update image to ${{ env.IMAGE_TAG }}
+
+          App:         ${{ inputs.app-name }}
+          Image:       ${{ inputs.ecr-repo }}:${{ env.IMAGE_TAG }}
+          Framework:   ${{ inputs.framework }}
+          Overlay(s):  ${{ steps.resolve-target.outputs.overlay }}
+          Environment: ${{ steps.resolve-target.outputs.environment }}
+          Source SHA:  ${{ github.sha }}"
+          git push origin "$BRANCH_NAME"

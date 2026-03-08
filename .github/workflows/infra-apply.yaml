@@ -1,0 +1,141 @@
+name: Infrastructure Apply (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      clusters:
+        description: "Space-separated list of clusters to apply (e.g. 'eks-ops eks-test-2')"
+        required: true
+        type: string
+      environment:
+        description: "GitHub Environment name (triggers required reviewers gate)"
+        required: true
+        type: string
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+
+  # Also accept direct dispatch for debugging
+  workflow_dispatch:
+    inputs:
+      clusters:
+        description: "Space-separated list of clusters to apply"
+        required: true
+        type: string
+        default: "eks-test-1"
+      environment:
+        description: "GitHub Environment name"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+          - incident
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: "1.8.5"
+  CHAINSAW_VERSION: "0.2.9"
+
+jobs:
+  apply:
+    name: Terraform Apply — ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    strategy:
+      # Apply clusters sequentially to avoid state conflicts
+      max-parallel: 1
+      matrix:
+        cluster: ${{ fromJson(format('["{0}"]', join(fromJson(format('["{0}"]', replace(inputs.clusters, ' ', '","'))), '","'))) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: tf-apply-${{ matrix.cluster }}-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.cluster }}
+          path: infra/terraform/clusters/${{ matrix.cluster }}
+        continue-on-error: true
+
+      - name: Terraform Init — ${{ matrix.cluster }}
+        working-directory: infra/terraform/clusters/${{ matrix.cluster }}
+        run: |
+          terraform init \
+            -backend-config="key=${{ matrix.cluster }}/terraform.tfstate" \
+            -reconfigure
+
+      - name: Terraform Apply — ${{ matrix.cluster }}
+        working-directory: infra/terraform/clusters/${{ matrix.cluster }}
+        run: |
+          if [[ -f tfplan ]]; then
+            echo "Applying saved plan..."
+            terraform apply -auto-approve tfplan
+          else
+            echo "No saved plan found, running apply directly..."
+            terraform apply \
+              -auto-approve \
+              -var="cluster_name=${{ matrix.cluster }}"
+          fi
+        env:
+          TF_VAR_cluster_name: ${{ matrix.cluster }}
+          TF_VAR_environment: ${{ inputs.environment }}
+
+      - name: Capture Terraform outputs
+        working-directory: infra/terraform/clusters/${{ matrix.cluster }}
+        run: |
+          terraform output -json > /tmp/tf-outputs-${{ matrix.cluster }}.json
+          cat /tmp/tf-outputs-${{ matrix.cluster }}.json
+
+      - name: Update kubeconfig for ${{ matrix.cluster }}
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ matrix.cluster }}" \
+            --region "${{ vars.AWS_REGION }}" \
+            --alias "${{ matrix.cluster }}"
+
+      - name: Install Chainsaw
+        run: |
+          curl -sSL \
+            "https://github.com/kyverno/chainsaw/releases/download/v${{ env.CHAINSAW_VERSION }}/chainsaw_linux_amd64.tar.gz" \
+            | tar -xzf - chainsaw
+          chmod +x chainsaw
+          sudo mv chainsaw /usr/local/bin/chainsaw
+          chainsaw version
+
+      - name: Run Chainsaw tests — ${{ matrix.cluster }}
+        run: |
+          chainsaw test \
+            --test-dir infra/chainsaw/tests \
+            --config infra/chainsaw/config.yaml \
+            --report-name "chainsaw-${{ matrix.cluster }}-${{ github.run_id }}" \
+            --report-format JSON
+        env:
+          KUBECONFIG: ~/.kube/config
+          CLUSTER: ${{ matrix.cluster }}
+          ENVIRONMENT: ${{ inputs.environment }}
+
+      - name: Upload Chainsaw report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chainsaw-report-${{ matrix.cluster }}
+          path: "chainsaw-${{ matrix.cluster }}-${{ github.run_id }}.json"
+          retention-days: 30

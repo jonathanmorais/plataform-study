@@ -1,0 +1,403 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "uid": "istio-mesh",
+  "title": "Istio Mesh — study-platform",
+  "description": "Istio service mesh health for the multi-primary setup on eks-test-1 (staging) and eks-test-2 (prod). Shows mTLS rates, cross-cluster traffic, VirtualService routing weights, control plane health, and east-west gateway throughput.",
+  "tags": ["study-platform", "istio", "mesh", "mtls", "sre"],
+  "style": "dark",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": "${DS_PROMETHEUS}",
+        "query": "label_values(up{job=\"istiod\"}, cluster)",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "refresh": 2
+      },
+      {
+        "name": "namespace",
+        "label": "Namespace",
+        "type": "query",
+        "datasource": "${DS_PROMETHEUS}",
+        "query": "label_values(istio_requests_total{cluster=~\"$cluster\"}, destination_service_namespace)",
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "mTLS Success Rate",
+      "description": "Percentage of requests using mutual TLS. SLO target: >99.9%. In STRICT mode all in-mesh traffic should be 100% mTLS.",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3,
+          "min": 0.95,
+          "max": 1.0,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.995 },
+              { "color": "green", "value": 0.999 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "showThresholdLabels": true,
+        "showThresholdMarkers": true,
+        "text": { "valueSize": 24 }
+      },
+      "targets": [
+        {
+          "expr": "istio:mtls_success_ratio",
+          "legendFormat": "mTLS Success Rate",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Istiod Status",
+      "description": "Istiod pod readiness across clusters.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "mappings": []
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "text": { "valueSize": 28 },
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum by (cluster) (up{job=\"istiod\", namespace=\"istio-system\", cluster=~\"$cluster\"})",
+          "legendFormat": "{{ cluster }}",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "East-West Gateway Status",
+      "description": "East-west gateway pod readiness. Required for cross-cluster routing between eks-test-1 and eks-test-2.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 4 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "text": { "valueSize": 28 }
+      },
+      "targets": [
+        {
+          "expr": "sum by (cluster) (up{app=\"istio-eastwestgateway\", namespace=\"istio-system\", cluster=~\"$cluster\"})",
+          "legendFormat": "{{ cluster }}",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Cross-Cluster Request Rate",
+      "description": "Requests flowing between eks-test-1 and eks-test-2 through the east-west gateways. Breakdown by source and destination cluster.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean"] }
+      },
+      "targets": [
+        {
+          "expr": "sum by (source_cluster, destination_cluster) (\n  rate(istio_requests_total{\n    source_cluster!=\"\",\n    destination_cluster!=\"\",\n    source_cluster!=destination_cluster,\n    cluster=~\"$cluster\"\n  }[5m])\n)",
+          "legendFormat": "{{ source_cluster }} → {{ destination_cluster }}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "mTLS Rate — Trend",
+      "description": "mTLS success rate over time. Dips may indicate sidecar injection failures or PeerAuthentication policy changes.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0.9,
+          "max": 1.0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.995 },
+              { "color": "green", "value": 0.999 }
+            ]
+          },
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "min"] }
+      },
+      "targets": [
+        {
+          "expr": "sum by (destination_service_namespace) (\n  rate(istio_requests_total{connection_security_policy=\"mutual_tls\", destination_service_namespace=~\"$namespace\", cluster=~\"$cluster\"}[5m])\n)\n/\nsum by (destination_service_namespace) (\n  rate(istio_requests_total{destination_service_namespace=~\"$namespace\", cluster=~\"$cluster\"}[5m])\n)",
+          "legendFormat": "{{ destination_service_namespace }}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "VirtualService Canary Routing Weights",
+      "description": "Current traffic split between canary (v2) and stable (v1) versions. During Rundeck deploys this shows the canary progression: 10% → 100%.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": false
+          },
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "sum by (destination_version, destination_service_name) (\n  rate(istio_requests_total{\n    destination_service_namespace=~\"$namespace\",\n    cluster=~\"$cluster\",\n    destination_version!=\"\"\n  }[5m])\n)\n/\nsum by (destination_service_name) (\n  rate(istio_requests_total{\n    destination_service_namespace=~\"$namespace\",\n    cluster=~\"$cluster\"\n  }[5m])\n)",
+          "legendFormat": "{{ destination_service_name }} / {{ destination_version }}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Istio Control Plane — Pilot Push Latency",
+      "description": "Time istiod takes to push xDS configuration changes to Envoy proxies. High values indicate config propagation delays.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean", "max"] }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50,\n  sum(rate(pilot_proxy_convergence_time_bucket{cluster=~\"$cluster\"}[5m])) by (le, cluster)\n)",
+          "legendFormat": "p50 — {{ cluster }}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99,\n  sum(rate(pilot_proxy_convergence_time_bucket{cluster=~\"$cluster\"}[5m])) by (le, cluster)\n)",
+          "legendFormat": "p99 — {{ cluster }}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "East-West Gateway Throughput",
+      "description": "Bytes per second flowing through east-west gateways in both directions. Shows cross-cluster bandwidth consumption.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "never"
+          },
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean", "max"] }
+      },
+      "targets": [
+        {
+          "expr": "sum by (cluster) (\n  rate(istio_tcp_sent_bytes_total{app=\"istio-eastwestgateway\", cluster=~\"$cluster\"}[5m])\n)",
+          "legendFormat": "Sent — {{ cluster }}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (cluster) (\n  rate(istio_tcp_received_bytes_total{app=\"istio-eastwestgateway\", cluster=~\"$cluster\"}[5m])\n)",
+          "legendFormat": "Received — {{ cluster }}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Istiod Memory & CPU",
+      "description": "Resource consumption of istiod. Memory alert threshold: 1 GB. High memory usually correlates with large number of service entries or proxies.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }
+      },
+      "targets": [
+        {
+          "expr": "process_resident_memory_bytes{job=\"istiod\", namespace=\"istio-system\", cluster=~\"$cluster\"}",
+          "legendFormat": "RSS — {{ cluster }} / {{ pod }}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Envoy Proxy xDS Connected Clients",
+      "description": "Number of Envoy proxies connected to istiod for configuration updates. Sudden drops indicate proxy disconnections.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "min", "max"] }
+      },
+      "targets": [
+        {
+          "expr": "sum by (cluster) (pilot_xds{cluster=~\"$cluster\"})",
+          "legendFormat": "Connected Proxies — {{ cluster }}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

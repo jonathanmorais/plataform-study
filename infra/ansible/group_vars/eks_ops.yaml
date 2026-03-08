@@ -1,0 +1,12 @@
+---
+# Variables specific to the eks-ops cluster.
+
+cluster_name: eks-ops
+environment: ops
+kubeconfig_context: "arn:aws:eks:{{ aws_region }}:{{ aws_account_id }}:cluster/eks-ops"
+
+# ArgoCD runs here as the hub
+argocd_hub: true
+argocd_auto_sync: true
+argocd_prune: true
+argocd_self_heal: true

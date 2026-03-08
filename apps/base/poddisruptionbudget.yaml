@@ -1,0 +1,29 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: study-platform
+  namespace: study-platform
+  labels:
+    app: study-platform
+    app.kubernetes.io/name: study-platform
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: study-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  # minAvailable: 1 means at least 1 pod must remain running during:
+  #   - node drains (kubectl drain)
+  #   - cluster upgrades
+  #   - voluntary disruptions (evictions, pod rescheduling)
+  #
+  # With base replicas=2 and minAvailable=1, EKS can always drain 1 node
+  # safely, which is the minimum needed for rolling cluster upgrades.
+  #
+  # Prod overlay (test-2) uses replicas=3, so minAvailable=1 still allows
+  # losing 2 pods at once — which is safe for AZ failure scenarios.
+  # Consider bumping to minAvailable=2 in prod if SLO requires it.
+  minAvailable: 1
+
+  selector:
+    matchLabels:
+      app: study-platform

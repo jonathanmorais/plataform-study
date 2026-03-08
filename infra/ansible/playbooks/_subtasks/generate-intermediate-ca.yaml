@@ -1,0 +1,75 @@
+---
+# _subtasks/generate-intermediate-ca.yaml
+# Called by 01-seed-cacerts.yaml via include_tasks in a loop.
+# Loop var: _ca_item  (keys: cluster, cn)
+
+- name: "IntCA | Check if intermediate CA already exists for {{ _ca_item.cluster }}"
+  ansible.builtin.stat:
+    path: "{{ _certs_dir }}/{{ _ca_item.cluster }}/ca-cert.pem"
+  register: _int_cert_stat
+
+- name: "IntCA | Generate intermediate CA private key for {{ _ca_item.cluster }}"
+  ansible.builtin.command:
+    cmd: >-
+      openssl genrsa -out {{ _certs_dir }}/{{ _ca_item.cluster }}/ca-key.pem 4096
+    creates: "{{ _certs_dir }}/{{ _ca_item.cluster }}/ca-key.pem"
+  when: not _int_cert_stat.stat.exists
+
+- name: "IntCA | Set restrictive permissions on intermediate key for {{ _ca_item.cluster }}"
+  ansible.builtin.file:
+    path: "{{ _certs_dir }}/{{ _ca_item.cluster }}/ca-key.pem"
+    mode: "0600"
+
+- name: "IntCA | Generate CSR for intermediate CA {{ _ca_item.cluster }}"
+  ansible.builtin.command:
+    cmd: >-
+      openssl req -new
+      -key {{ _certs_dir }}/{{ _ca_item.cluster }}/ca-key.pem
+      -out {{ _certs_dir }}/{{ _ca_item.cluster }}/ca-csr.pem
+      -subj "/O=study-platform/CN={{ _ca_item.cn }}"
+    creates: "{{ _certs_dir }}/{{ _ca_item.cluster }}/ca-csr.pem"
+  when: not _int_cert_stat.stat.exists
+
+- name: "IntCA | Write intermediate CA openssl ext file for {{ _ca_item.cluster }}"
+  ansible.builtin.copy:
+    dest: "{{ _certs_dir }}/{{ _ca_item.cluster }}/ca-ext.cnf"
+    mode: "0644"
+    content: |
+      [v3_ca]
+      subjectKeyIdentifier   = hash
+      authorityKeyIdentifier = keyid:always,issuer
+      basicConstraints       = critical, CA:true, pathlen:0
+      keyUsage               = critical, digitalSignature, cRLSign, keyCertSign
+  when: not _int_cert_stat.stat.exists
+
+- name: "IntCA | Sign intermediate CA certificate with root CA for {{ _ca_item.cluster }}"
+  ansible.builtin.command:
+    cmd: >-
+      openssl x509 -req
+      -days {{ _int_days }}
+      -in {{ _certs_dir }}/{{ _ca_item.cluster }}/ca-csr.pem
+      -CA {{ _root_cert }}
+      -CAkey {{ _root_key }}
+      -CAcreateserial
+      -out {{ _certs_dir }}/{{ _ca_item.cluster }}/ca-cert.pem
+      -extensions v3_ca
+      -extfile {{ _certs_dir }}/{{ _ca_item.cluster }}/ca-ext.cnf
+    creates: "{{ _certs_dir }}/{{ _ca_item.cluster }}/ca-cert.pem"
+  when: not _int_cert_stat.stat.exists
+
+- name: "IntCA | Build cert-chain.pem (intermediate + root) for {{ _ca_item.cluster }}"
+  ansible.builtin.shell:
+    cmd: >-
+      cat
+      {{ _certs_dir }}/{{ _ca_item.cluster }}/ca-cert.pem
+      {{ _root_cert }}
+      > {{ _certs_dir }}/{{ _ca_item.cluster }}/cert-chain.pem
+    creates: "{{ _certs_dir }}/{{ _ca_item.cluster }}/cert-chain.pem"
+  when: not _int_cert_stat.stat.exists
+
+- name: "IntCA | Copy root-cert.pem into cluster cert dir for {{ _ca_item.cluster }}"
+  ansible.builtin.copy:
+    src: "{{ _root_cert }}"
+    dest: "{{ _certs_dir }}/{{ _ca_item.cluster }}/root-cert.pem"
+    mode: "0644"
+    remote_src: true

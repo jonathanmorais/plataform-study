@@ -1,0 +1,121 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ── Production overlay (eks-test-2) ──────────────────────────────────────────
+# Auto-sync DISABLED in ArgoCD — Rundeck triggers the sync at scheduled time.
+# See CLAUDE.MD: "ArgoCD detects drift — waits for Rundeck trigger"
+# Rundeck job: prod-deploy → argocd app sync study-platform-test-2
+
+namespace: study-platform
+
+resources:
+  - ../../base
+  - namespace.yaml
+
+# ── Image tag management ──────────────────────────────────────────────────────
+# CI pipeline updates newTag only when merging to main (after release.yaml
+# creates the semver tag and the infra-apply.yaml applies to eks-test-2).
+# ArgoCD will show OutOfSync but will NOT auto-deploy — waits for Rundeck.
+images:
+  - name: REGISTRY/study-platform
+    newName: REGISTRY/study-platform
+    newTag: latest   # CI replaces this with the semver release tag (e.g. v1.5.0)
+
+# ── Environment labels ────────────────────────────────────────────────────────
+commonLabels:
+  environment: production
+  cluster: eks-test-2
+
+# ── ConfigMap patches — production values ────────────────────────────────────
+patches:
+  # Production ConfigMap overrides
+  - target:
+      kind: ConfigMap
+      name: study-platform-config
+    patch: |-
+      - op: replace
+        path: /data/APP_ENV
+        value: production
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/OTEL_TRACES_SAMPLER_ARG
+        value: "0.1"
+      - op: replace
+        path: /data/DB_POOL_MIN
+        value: "5"
+      - op: replace
+        path: /data/DB_POOL_MAX
+        value: "20"
+      - op: replace
+        path: /data/SHUTDOWN_TIMEOUT
+        value: "45"
+
+  # Production: 3 replicas minimum for HA across 3 AZs
+  - target:
+      kind: Deployment
+      name: study-platform
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+
+  # Production resource limits — stricter ceiling, higher floor
+  - target:
+      kind: Deployment
+      name: study-platform
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+
+  # HPA: higher floor (3) and ceiling (10) for prod
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: study-platform
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 10
+
+  # PDB: in prod with 3 replicas, keep at least 2 available during disruptions
+  # This means only 1 pod can be disrupted at a time, protecting the SLO
+  # even during a rolling cluster upgrade across AZs.
+  - target:
+      kind: PodDisruptionBudget
+      name: study-platform
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 2
+
+  # Production topology spread — enforce strict AZ spread
+  - target:
+      kind: Deployment
+      name: study-platform
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app: study-platform
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app: study-platform

@@ -1,0 +1,66 @@
+# Istio Ingress Gateway — study-platform
+#
+# This Gateway configures the Istio ingress gateway to accept inbound
+# HTTP and HTTPS traffic for study-platform.example.com on both
+# eks-test-1 (staging) and eks-test-2 (prod).
+#
+# TLS behaviour:
+#   - Port 80 (HTTP): redirects all traffic to HTTPS (301)
+#   - Port 443 (HTTPS): terminates TLS using the certificate in Secret
+#     "study-platform-tls" (managed by cert-manager / AWS ACM)
+#
+# The VirtualService (virtual-service.yaml) binds to this Gateway and
+# defines routing rules, timeouts, retries, and canary weights.
+#
+# Certificate secret must exist in the same namespace as the Gateway:
+#   kubectl create secret tls study-platform-tls \
+#     --cert=tls.crt --key=tls.key \
+#     -n istio-system
+#
+# Apply:
+#   kubectl apply -f istio/gateway.yaml --context eks-test-1
+#   kubectl apply -f istio/gateway.yaml --context eks-test-2
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: study-platform-gateway
+  namespace: istio-system
+  labels:
+    app: study-platform
+    app.kubernetes.io/name: study-platform-gateway
+    app.kubernetes.io/component: ingress-gateway
+    app.kubernetes.io/part-of: study-platform
+    app.kubernetes.io/managed-by: argocd
+spec:
+  selector:
+    # Matches the Istio ingress gateway pods.
+    istio: ingressgateway
+  servers:
+    # ---------------------------------------------------------------------------
+    # HTTP — redirect to HTTPS
+    # ---------------------------------------------------------------------------
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "study-platform.example.com"
+      tls:
+        # Redirect all HTTP requests to HTTPS with a 301 response.
+        # Envoy handles the redirect before the VirtualService is consulted.
+        httpsRedirect: true
+
+    # ---------------------------------------------------------------------------
+    # HTTPS — terminate TLS, forward to VirtualService
+    # ---------------------------------------------------------------------------
+    - port:
+        number: 443
+        name: https
+        protocol: HTTPS
+      hosts:
+        - "study-platform.example.com"
+      tls:
+        mode: SIMPLE
+        # TLS certificate managed by cert-manager (Let's Encrypt) or AWS ACM.
+        # The secret must be in the same namespace as the Gateway (istio-system).
+        credentialName: study-platform-tls

@@ -1,0 +1,87 @@
+---
+# Static inventory for the study-platform Ansible automation.
+# EKS node groups are NOT directly SSH-managed after bootstrap; they appear
+# here as placeholder documentation so that group_vars are applied correctly.
+# Dynamic inventory for actual EC2 instances is provided by the aws_ec2 plugin
+# (inventory/aws_ec2.yaml) during the AMI build phase.
+
+all:
+  vars:
+    aws_region: us-east-1
+    ansible_ssh_common_args: >-
+      -o StrictHostKeyChecking=no
+      -o UserKnownHostsFile=/dev/null
+      -o ConnectTimeout=30
+
+  children:
+
+    # -------------------------------------------------------------------------
+    # builder — localhost is used as the control node that launches the EC2
+    # builder instance, manages AMI lifecycle, and writes SSM parameters.
+    # -------------------------------------------------------------------------
+    builder:
+      hosts:
+        localhost:
+          ansible_connection: local
+          ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+    # -------------------------------------------------------------------------
+    # builder_ec2 — populated dynamically by the build-ami.yaml playbook via
+    # add_host after the builder EC2 is launched and SSH-reachable.
+    # -------------------------------------------------------------------------
+    builder_ec2:
+      hosts: {}
+      vars:
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: ~/.ssh/eks-study-platform.pem
+
+    # -------------------------------------------------------------------------
+    # eks_ops — control-plane cluster hosting ArgoCD, Vault, observability.
+    # Nodes are NOT managed via SSH in steady state; this group exists so
+    # group_vars/eks_ops.yaml variables are available to kubectl/aws tasks.
+    # -------------------------------------------------------------------------
+    eks_ops:
+      hosts: {}
+      vars:
+        cluster_name: eks-ops
+        kubeconfig_context: "arn:aws:eks:us-east-1:{{ aws_account_id }}:cluster/eks-ops"
+        argocd_namespace: argocd
+        environment: ops
+
+    # -------------------------------------------------------------------------
+    # eks_staging (eks-test-1) — staging spoke cluster.
+    # -------------------------------------------------------------------------
+    eks_staging:
+      hosts: {}
+      vars:
+        cluster_name: eks-test-1
+        kubeconfig_context: "arn:aws:eks:us-east-1:{{ aws_account_id }}:cluster/eks-test-1"
+        istio_network: network-test-1
+        environment: staging
+
+    # -------------------------------------------------------------------------
+    # eks_prod (eks-test-2) — production spoke cluster.
+    # -------------------------------------------------------------------------
+    eks_prod:
+      hosts: {}
+      vars:
+        cluster_name: eks-test-2
+        kubeconfig_context: "arn:aws:eks:us-east-1:{{ aws_account_id }}:cluster/eks-test-2"
+        istio_network: network-test-2
+        environment: production
+
+    # -------------------------------------------------------------------------
+    # eks_spokes — convenience group containing both spoke clusters.
+    # -------------------------------------------------------------------------
+    eks_spokes:
+      children:
+        eks_staging: {}
+        eks_prod: {}
+
+    # -------------------------------------------------------------------------
+    # eks_all — all three clusters.
+    # -------------------------------------------------------------------------
+    eks_all:
+      children:
+        eks_ops: {}
+        eks_spokes: {}

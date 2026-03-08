@@ -1,0 +1,126 @@
+# DestinationRule — study-platform traffic policy and version subsets
+#
+# Defines two subsets (v1, v2) used by the VirtualService for canary routing,
+# global traffic policies (connection pooling, outlier detection, load balancing),
+# and TLS settings for mTLS within the mesh.
+#
+# Subsets:
+#   v1 — stable / current version. Pods must carry label: version=v1
+#   v2 — new version under promotion. Pods must carry label: version=v2
+#
+# The Deployment manifest for each version must include the version label, e.g.:
+#   labels:
+#     app: study-platform
+#     version: v1          # or v2 for the new version
+#
+# OutlierDetection:
+#   Automatically ejects an endpoint (pod) from the load balancing pool
+#   when it exhibits consecutive errors, protecting clients from repeatedly
+#   hitting a failing pod. Ejected pods are re-admitted after baseEjectionTime.
+#
+# Apply:
+#   kubectl apply -f istio/destination-rule.yaml --context eks-test-1
+#   kubectl apply -f istio/destination-rule.yaml --context eks-test-2
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: study-platform
+  namespace: study-platform
+  labels:
+    app: study-platform
+    app.kubernetes.io/name: study-platform
+    app.kubernetes.io/component: destination-rule
+    app.kubernetes.io/part-of: study-platform
+    app.kubernetes.io/managed-by: argocd
+spec:
+  host: study-platform
+
+  # ---------------------------------------------------------------------------
+  # Global traffic policy — applies to all subsets unless overridden.
+  # ---------------------------------------------------------------------------
+  trafficPolicy:
+    # Load balancing algorithm applied across all healthy endpoints.
+    loadBalancer:
+      simple: ROUND_ROBIN
+
+    # Connection pool settings control the volume of connections Envoy
+    # will open to upstream pods. Protects pods from being overwhelmed
+    # by connection storms or slow clients.
+    connectionPool:
+      tcp:
+        # Maximum number of TCP connections to each upstream pod.
+        maxConnections: 100
+        # TCP keepalive settings to detect dead connections.
+        tcpKeepalive:
+          time: 7200s
+          interval: 75s
+          probes: 10
+      http:
+        # Maximum number of pending HTTP requests per connection.
+        http1MaxPendingRequests: 100
+        # Maximum number of concurrent HTTP/2 requests per connection.
+        http2MaxRequests: 1000
+        # Maximum number of requests per connection before it is closed.
+        # Forces connection recycling to distribute load across pods.
+        maxRequestsPerConnection: 100
+        # Maximum number of retries in the connection pool.
+        maxRetries: 3
+        # Time to wait for a connection to an upstream pod.
+        connectTimeout: 10s
+        # Time a connection can remain idle before being closed.
+        idleTimeout: 90s
+
+    # Outlier detection ejects unhealthy endpoints from the load balancing
+    # pool. Envoy tracks consecutive errors per upstream pod.
+    outlierDetection:
+      # Number of consecutive 5xx errors before ejection.
+      consecutiveGatewayErrors: 5
+      consecutive5xxErrors: 5
+      # Interval at which ejection analysis is performed.
+      interval: 10s
+      # Minimum duration an ejected host remains ejected.
+      # Actual duration = baseEjectionTime * number_of_ejections (capped at maxEjectionPercent).
+      baseEjectionTime: 30s
+      # Maximum percentage of hosts that can be ejected simultaneously.
+      # Prevents the entire pool from being ejected during a widespread failure.
+      maxEjectionPercent: 50
+      # Minimum health percentage required before outlier detection activates.
+      # Ensures at least 30% of hosts are healthy before ejections begin.
+      minHealthPercent: 30
+
+    # mTLS between services within the mesh.
+    # ISTIO_MUTUAL uses the sidecar-injected certificate — no manual cert management.
+    tls:
+      mode: ISTIO_MUTUAL
+
+  # ---------------------------------------------------------------------------
+  # Subsets — used by the VirtualService to route canary traffic.
+  # Each subset selects pods by the "version" label.
+  # ---------------------------------------------------------------------------
+  subsets:
+    # v1 — stable / current production version.
+    # Receives 100% of traffic at rest. Traffic weight decreases to 90%
+    # during canary phase and drops to 0% after full rollout to v2.
+    - name: v1
+      labels:
+        version: v1
+      # Subset-level traffic policy inherits the global trafficPolicy above.
+      # Override here only if v1 needs different connection/outlier settings.
+      trafficPolicy:
+        loadBalancer:
+          simple: ROUND_ROBIN
+        tls:
+          mode: ISTIO_MUTUAL
+
+    # v2 — new version under promotion.
+    # Receives 0% of traffic at rest; patched to 10% (canary) then 100%
+    # by Rundeck prod-deploy. After successful promotion, v2 becomes the
+    # new v1 in the next release cycle.
+    - name: v2
+      labels:
+        version: v2
+      trafficPolicy:
+        loadBalancer:
+          simple: ROUND_ROBIN
+        tls:
+          mode: ISTIO_MUTUAL

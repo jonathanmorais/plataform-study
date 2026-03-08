@@ -1,0 +1,73 @@
+name: Node.js — CI/CD Template (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: "Application name"
+        required: true
+        type: string
+      ecr-repo:
+        description: "Full ECR repository URI"
+        required: true
+        type: string
+      node-version:
+        description: "Node.js version"
+        required: false
+        type: string
+        default: "20"
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+      GITOPS_REPO_TOKEN:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  ci:
+    name: Test & Lint — Node.js ${{ inputs.node-version }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+        env:
+          CI: "true"
+          NODE_ENV: test
+
+      - name: Upload test coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ inputs.app-name }}
+          path: coverage/
+          retention-days: 14
+
+  build-and-deploy:
+    name: Build, Push & GitOps Update
+    needs: ci
+    uses: ./.github/workflows/templates/_base.yaml
+    with:
+      app-name: ${{ inputs.app-name }}
+      ecr-repo: ${{ inputs.ecr-repo }}
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      GITOPS_REPO_TOKEN: ${{ secrets.GITOPS_REPO_TOKEN }}

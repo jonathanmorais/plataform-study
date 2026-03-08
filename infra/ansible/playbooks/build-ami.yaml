@@ -1,0 +1,382 @@
+---
+# =============================================================================
+# playbooks/build-ami.yaml
+#
+# Three-phase AMI build for EKS worker nodes.
+#
+# Usage:
+#   ansible-playbook playbooks/build-ami.yaml \
+#     -e build_version=1.3.0 \
+#     -e git_sha=$(git rev-parse HEAD)
+#
+# Required extra-vars:
+#   build_version  – semver string, e.g. "1.3.0"
+#   git_sha        – full 40-char git SHA
+#
+# Required environment variables:
+#   AWS_ACCOUNT_ID         – 12-digit AWS account number
+#   AMI_BUILDER_SUBNET_ID  – subnet where builder EC2 will be launched
+#   AMI_BUILDER_SG_ID      – security group allowing SSH from control node
+# =============================================================================
+
+- name: "Phase 1 — Launch AMI builder EC2 instance"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    _short_sha: "{{ git_sha[:8] }}"
+    _ami_name: "{{ ami_name_prefix }}-{{ build_version }}-{{ git_sha[:8] }}"
+    _builder_tag: "ami-builder-{{ build_version }}-{{ git_sha[:8] }}"
+
+  pre_tasks:
+    - name: Validate required extra-vars
+      ansible.builtin.assert:
+        that:
+          - build_version is defined
+          - build_version | length > 0
+          - git_sha is defined
+          - git_sha | length == 40
+        fail_msg: >-
+          Both 'build_version' and 'git_sha' (40-char) must be supplied via -e.
+
+    - name: Check AWS credentials are available
+      ansible.builtin.command: aws sts get-caller-identity --query Account --output text
+      register: _caller_identity
+      changed_when: false
+      failed_when: _caller_identity.rc != 0
+
+    - name: Confirm AWS account matches expected
+      ansible.builtin.assert:
+        that: _caller_identity.stdout == aws_account_id
+        fail_msg: >-
+          AWS_ACCOUNT_ID env var ({{ aws_account_id }}) does not match
+          STS caller identity ({{ _caller_identity.stdout }}).
+
+  tasks:
+    - name: "Phase 1 | AMI build block"
+      block:
+
+        - name: "Phase 1 | Launch builder EC2 instance"
+          amazon.aws.ec2_instance:
+            region: "{{ aws_region }}"
+            name: "{{ _builder_tag }}"
+            key_name: "{{ ami_builder_key_name }}"
+            instance_type: "{{ ami_builder_instance_type }}"
+            image_id: "{{ ami_base_id }}"
+            subnet_id: "{{ ami_builder_subnet_id }}"
+            security_groups:
+              - "{{ ami_builder_security_group_id }}"
+            iam_instance_profile: "{{ ami_builder_iam_instance_profile }}"
+            volumes:
+              - device_name: /dev/xvda
+                ebs:
+                  volume_size: "{{ ami_builder_volume_size_gb }}"
+                  volume_type: gp3
+                  encrypted: true
+                  delete_on_termination: true
+            network:
+              assign_public_ip: false
+            metadata_options:
+              http_tokens: required          # IMDSv2 only
+              http_put_response_hop_limit: 1
+            user_data: |
+              #!/bin/bash
+              set -e
+              # Ensure ec2-user can sudo without tty during Ansible runs
+              echo 'ec2-user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-ansible
+              chmod 440 /etc/sudoers.d/90-ansible
+            tags:
+              Name: "{{ _builder_tag }}"
+              Project: study-platform
+              ManagedBy: ansible-ami-builder
+              Role: ami-builder
+              BuildVersion: "{{ build_version }}"
+              GitSha: "{{ git_sha }}"
+              Environment: build
+            wait: true
+            wait_timeout: 300
+            state: running
+          register: _builder_instance
+
+        - name: "Phase 1 | Store builder instance ID for cleanup"
+          ansible.builtin.set_fact:
+            builder_instance_id: "{{ _builder_instance.instances[0].instance_id }}"
+            builder_private_ip: "{{ _builder_instance.instances[0].private_ip_address }}"
+          cacheable: true
+
+        - name: "Phase 1 | Wait for SSH to become available on builder"
+          ansible.builtin.wait_for:
+            host: "{{ builder_private_ip }}"
+            port: 22
+            delay: "{{ ssh_wait_delay }}"
+            timeout: "{{ ssh_wait_timeout }}"
+            state: started
+
+        - name: "Phase 1 | Add builder to in-memory inventory group builder_ec2"
+          ansible.builtin.add_host:
+            name: "{{ builder_private_ip }}"
+            groups: builder_ec2
+            ansible_host: "{{ builder_private_ip }}"
+            ansible_user: ec2-user
+            ansible_ssh_private_key_file: ~/.ssh/eks-study-platform.pem
+            ansible_ssh_common_args: >-
+              -o StrictHostKeyChecking=no
+              -o UserKnownHostsFile=/dev/null
+            build_version: "{{ build_version }}"
+            git_sha: "{{ git_sha }}"
+
+        - name: "Phase 1 | Wait for cloud-init to finish on builder"
+          ansible.builtin.raw: >-
+            cloud-init status --wait
+          delegate_to: "{{ builder_private_ip }}"
+          vars:
+            ansible_user: ec2-user
+            ansible_ssh_private_key_file: ~/.ssh/eks-study-platform.pem
+          changed_when: false
+          retries: 5
+          delay: 10
+
+      rescue:
+        - name: "Phase 1 | RESCUE — record failure, cleanup will run in Phase 3"
+          ansible.builtin.set_fact:
+            build_phase1_failed: true
+          failed_when: false
+
+        - name: "Phase 1 | RESCUE — re-raise to abort Phase 2"
+          ansible.builtin.fail:
+            msg: "Phase 1 failed — builder EC2 could not be initialised. See errors above."
+
+
+# =============================================================================
+# Phase 2 — Configure the builder EC2 in-place
+# =============================================================================
+- name: "Phase 2 — Harden and configure builder EC2"
+  hosts: builder_ec2
+  gather_facts: true
+  become: true
+
+  vars:
+    # Propagate build metadata as role vars
+    _short_sha: "{{ git_sha[:8] }}"
+
+  pre_tasks:
+    - name: "Phase 2 | Gather OS facts"
+      ansible.builtin.setup:
+        gather_subset:
+          - min
+          - hardware
+          - network
+
+  tasks:
+    - name: "Phase 2 | Configuration block"
+      block:
+
+        - name: "Phase 2 | Apply security patches"
+          ansible.builtin.import_role:
+            name: security-patches
+
+        - name: "Phase 2 | Apply kernel hardening"
+          ansible.builtin.import_role:
+            name: kernel-hardening
+
+        - name: "Phase 2 | Install and configure SSM agent"
+          ansible.builtin.import_role:
+            name: ssm-agent
+
+        - name: "Phase 2 | Install and configure CloudWatch agent"
+          ansible.builtin.import_role:
+            name: cloudwatch-agent
+
+        - name: "Phase 2 | Configure containerd"
+          ansible.builtin.import_role:
+            name: containerd-config
+
+        - name: "Phase 2 | Apply Istio kernel parameters"
+          ansible.builtin.import_role:
+            name: istio-kernel-params
+
+        - name: "Phase 2 | Run pre-snapshot validation"
+          ansible.builtin.import_role:
+            name: validate
+
+        - name: "Phase 2 | Run cleanup (remove build artefacts)"
+          ansible.builtin.import_role:
+            name: cleanup
+
+      rescue:
+        - name: "Phase 2 | RESCUE — record failure for Phase 3 always-block"
+          ansible.builtin.set_fact:
+            build_phase2_failed: true
+          delegate_to: localhost
+          delegate_facts: true
+
+        - name: "Phase 2 | RESCUE — re-raise"
+          ansible.builtin.fail:
+            msg: "Phase 2 configuration failed. Instance will be terminated in Phase 3."
+
+
+# =============================================================================
+# Phase 3 — Snapshot → AMI → SSM → terminate (always runs)
+# =============================================================================
+- name: "Phase 3 — Create AMI, publish SSM params, terminate builder"
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    _short_sha: "{{ git_sha[:8] }}"
+    _ami_name: "{{ ami_name_prefix }}-{{ build_version }}-{{ git_sha[:8] }}"
+    _built_at: "{{ ansible_date_time.iso8601 | default(lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')) }}"
+
+  tasks:
+    - name: "Phase 3 | Stop builder instance before snapshotting"
+      amazon.aws.ec2_instance:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ builder_instance_id }}"
+        state: stopped
+        wait: true
+        wait_timeout: 300
+      when: builder_instance_id is defined
+
+    - name: "Phase 3 | Create AMI from stopped builder"
+      amazon.aws.ec2_ami:
+        region: "{{ aws_region }}"
+        instance_id: "{{ builder_instance_id }}"
+        name: "{{ _ami_name }}"
+        description: >-
+          EKS worker node AMI for study-platform {{ build_version }}
+          (git: {{ git_sha }}) built {{ _built_at }}
+        no_reboot: true
+        wait: true
+        wait_timeout: "{{ ami_available_timeout }}"
+        tags:
+          Name: "{{ _ami_name }}"
+          Project: study-platform
+          ManagedBy: ansible-ami-builder
+          BuildVersion: "{{ build_version }}"
+          GitSha: "{{ git_sha }}"
+          BuiltAt: "{{ _built_at }}"
+          KubernetesVersion: "{{ kubernetes_version }}"
+          ContainerdVersion: "{{ containerd_version }}"
+          IstioVersion: "{{ istio_version }}"
+          Environment: production
+      register: _new_ami
+      when: >-
+        builder_instance_id is defined and
+        (build_phase2_failed is not defined or not build_phase2_failed)
+
+    - name: "Phase 3 | Store new AMI ID"
+      ansible.builtin.set_fact:
+        new_ami_id: "{{ _new_ami.image_id }}"
+      when: _new_ami is not skipped and _new_ami.image_id is defined
+
+    - name: "Phase 3 | Write /study-platform/eks/ami/latest to SSM"
+      amazon.aws.ssm_parameter:
+        region: "{{ aws_region }}"
+        name: "{{ ami_base_ssm_path }}/latest"
+        value: "{{ new_ami_id }}"
+        string_type: String
+        description: "Latest study-platform EKS node AMI ID"
+        tags:
+          Project: study-platform
+          ManagedBy: ansible
+      when: new_ami_id is defined
+
+    - name: "Phase 3 | Write /study-platform/eks/ami/version to SSM"
+      amazon.aws.ssm_parameter:
+        region: "{{ aws_region }}"
+        name: "{{ ami_base_ssm_path }}/version"
+        value: "{{ build_version }}"
+        string_type: String
+        description: "Build version of the latest study-platform EKS node AMI"
+        tags:
+          Project: study-platform
+          ManagedBy: ansible
+      when: new_ami_id is defined
+
+    - name: "Phase 3 | Write /study-platform/eks/ami/git-sha to SSM"
+      amazon.aws.ssm_parameter:
+        region: "{{ aws_region }}"
+        name: "{{ ami_base_ssm_path }}/git-sha"
+        value: "{{ git_sha }}"
+        string_type: String
+        description: "Git SHA of the source commit used for the latest AMI"
+        tags:
+          Project: study-platform
+          ManagedBy: ansible
+      when: new_ami_id is defined
+
+    - name: "Phase 3 | Write /study-platform/eks/ami/built-at to SSM"
+      amazon.aws.ssm_parameter:
+        region: "{{ aws_region }}"
+        name: "{{ ami_base_ssm_path }}/built-at"
+        value: "{{ _built_at }}"
+        string_type: String
+        description: "ISO-8601 timestamp of the latest AMI build"
+        tags:
+          Project: study-platform
+          ManagedBy: ansible
+      when: new_ami_id is defined
+
+    - name: "Phase 3 | Deprecate previous latest AMI (remove 'latest' tag)"
+      block:
+        - name: "Phase 3 | Find previously tagged latest AMIs"
+          amazon.aws.ec2_ami_info:
+            region: "{{ aws_region }}"
+            owners:
+              - self
+            filters:
+              "tag:Project": study-platform
+              "tag:BuildVersion": "{{ build_version }}"
+          register: _existing_amis
+
+        - name: "Phase 3 | Remove 'latest' pseudo-marker from older AMIs"
+          amazon.aws.ec2_tag:
+            region: "{{ aws_region }}"
+            resource: "{{ item.image_id }}"
+            state: absent
+            tags:
+              IsLatest: "true"
+          loop: "{{ _existing_amis.images }}"
+          when:
+            - item.image_id != new_ami_id
+            - "'IsLatest' in item.tags"
+
+        - name: "Phase 3 | Tag new AMI as latest"
+          amazon.aws.ec2_tag:
+            region: "{{ aws_region }}"
+            resource: "{{ new_ami_id }}"
+            state: present
+            tags:
+              IsLatest: "true"
+      when: new_ami_id is defined
+
+    - name: "Phase 3 | ALWAYS — terminate builder EC2"
+      amazon.aws.ec2_instance:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ builder_instance_id }}"
+        state: absent
+        wait: true
+        wait_timeout: 120
+      when: builder_instance_id is defined
+      register: _termination
+      failed_when: false   # never block on termination failure
+
+    - name: "Phase 3 | Print build summary"
+      ansible.builtin.debug:
+        msg:
+          - "========== AMI Build Summary =========="
+          - "AMI Name   : {{ _ami_name }}"
+          - "AMI ID     : {{ new_ami_id | default('NOT CREATED (build failed)') }}"
+          - "Version    : {{ build_version }}"
+          - "Git SHA    : {{ git_sha }}"
+          - "Built At   : {{ _built_at }}"
+          - "SSM Latest : {{ ami_base_ssm_path }}/latest"
+          - "======================================="
+
+    - name: "Phase 3 | Fail playbook if Phase 2 reported failure"
+      ansible.builtin.fail:
+        msg: >-
+          AMI build FAILED during Phase 2 configuration. Builder has been
+          terminated. Check Phase 2 output above for root cause.
+      when: build_phase2_failed is defined and build_phase2_failed | bool

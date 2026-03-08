@@ -1,0 +1,428 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: study-platform-infra
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kube-prometheus-stack
+    role: alert-rules
+    team: sre
+    app.kubernetes.io/part-of: study-platform
+spec:
+  groups:
+    # ---------------------------------------------------------------------------
+    # Node Health
+    # ---------------------------------------------------------------------------
+    - name: infra.nodes
+      interval: 30s
+      rules:
+        # Recording rule — node CPU utilization (1 - idle %)
+        - record: node:cpu_utilization:ratio
+          expr: |
+            1 - avg by (instance, cluster) (
+              rate(node_cpu_seconds_total{mode="idle"}[5m])
+            )
+
+        # Recording rule — node memory utilization
+        - record: node:memory_utilization:ratio
+          expr: |
+            1 - (
+              node_memory_MemAvailable_bytes
+              /
+              node_memory_MemTotal_bytes
+            )
+
+        # Recording rule — node disk utilization (root filesystem)
+        - record: node:disk_utilization:ratio
+          expr: |
+            1 - (
+              node_filesystem_avail_bytes{mountpoint="/", fstype!="tmpfs"}
+              /
+              node_filesystem_size_bytes{mountpoint="/", fstype!="tmpfs"}
+            )
+
+        # ---------------------------------------------------------------------------
+        # P1 — Node is down
+        # A node being unreachable for 2 minutes means pods may not be rescheduled
+        # yet. If multiple nodes fail simultaneously (e.g., AZ outage) the impact
+        # is severe. Page immediately.
+        # ---------------------------------------------------------------------------
+        - alert: NodeDown
+          expr: |
+            up{job="node-exporter"} == 0
+          for: 2m
+          labels:
+            severity: P1
+            team: sre
+            component: node
+          annotations:
+            summary: "P1 — Node {{ $labels.instance }} is down"
+            description: |
+              Node {{ $labels.instance }} in cluster {{ $labels.cluster }} has been
+              unreachable for 2 minutes. The node exporter is not responding.
+              Pods on this node may not have been rescheduled yet.
+              Check if the AWS ASG is replacing this instance.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-cluster-node-failure.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"
+
+        # ---------------------------------------------------------------------------
+        # P3 — Node CPU above 80% for 30 minutes
+        # Sustained high CPU can degrade pod performance. Not immediately critical
+        # but schedule investigation. Ticket for next business day.
+        # ---------------------------------------------------------------------------
+        - alert: NodeCpuHigh
+          expr: |
+            node:cpu_utilization:ratio > 0.80
+          for: 30m
+          labels:
+            severity: P3
+            team: sre
+            component: node
+          annotations:
+            summary: "P3 — Node {{ $labels.instance }} CPU above 80%"
+            description: |
+              Node {{ $labels.instance }} CPU utilization is {{ $value | humanizePercentage }}
+              (sustained > 30 minutes). Consider checking which pods are consuming CPU or
+              if the node group needs scaling.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-cluster-node-failure.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"
+
+        # ---------------------------------------------------------------------------
+        # P2 — Node memory above 90% for 10 minutes
+        # At 90% memory, OOM kills become likely. This is an operational priority.
+        # ---------------------------------------------------------------------------
+        - alert: NodeMemoryHigh
+          expr: |
+            node:memory_utilization:ratio > 0.90
+          for: 10m
+          labels:
+            severity: P2
+            team: sre
+            component: node
+          annotations:
+            summary: "P2 — Node {{ $labels.instance }} memory above 90%"
+            description: |
+              Node {{ $labels.instance }} memory utilization is {{ $value | humanizePercentage }}.
+              Available memory: {{ with query "node_memory_MemAvailable_bytes{instance='%s'}" $labels.instance }}{{ . | first | value | humanize1024 }}B{{ end }}.
+              OOM kills are likely if this persists. Check for memory leaks or oversized pods.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-cluster-node-failure.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"
+
+        # P2 — Node disk usage above 85%
+        - alert: NodeDiskHigh
+          expr: |
+            node:disk_utilization:ratio > 0.85
+          for: 15m
+          labels:
+            severity: P2
+            team: sre
+            component: node
+          annotations:
+            summary: "P2 — Node {{ $labels.instance }} disk above 85%"
+            description: |
+              Node {{ $labels.instance }} root filesystem is {{ $value | humanizePercentage }} full.
+              Container images, logs, and ephemeral storage compete for this space.
+              Clean up old images or expand the EBS volume.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-cluster-node-failure.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"
+
+    # ---------------------------------------------------------------------------
+    # PVC Storage
+    # ---------------------------------------------------------------------------
+    - name: infra.storage
+      interval: 60s
+      rules:
+        # Recording rule — PVC utilization ratio
+        - record: pvc:usage_ratio
+          expr: |
+            kubelet_volume_stats_used_bytes
+            /
+            kubelet_volume_stats_capacity_bytes
+
+        # ---------------------------------------------------------------------------
+        # P3 — PVC usage above 80%
+        # At 80% a PVC is approaching full. Databases writing to a full PVC will
+        # crash. File a ticket and expand or clean up data.
+        # ---------------------------------------------------------------------------
+        - alert: PvcUsageHigh
+          expr: |
+            (
+              kubelet_volume_stats_used_bytes
+              /
+              kubelet_volume_stats_capacity_bytes
+            ) > 0.80
+          for: 5m
+          labels:
+            severity: P3
+            team: sre
+            component: storage
+          annotations:
+            summary: "P3 — PVC {{ $labels.persistentvolumeclaim }} usage above 80%"
+            description: |
+              PVC {{ $labels.persistentvolumeclaim }} in namespace {{ $labels.namespace }}
+              is {{ $value | humanizePercentage }} full.
+              Used: {{ with query "kubelet_volume_stats_used_bytes{persistentvolumeclaim='%s',namespace='%s'}" $labels.persistentvolumeclaim $labels.namespace }}{{ . | first | value | humanize1024 }}B{{ end }}.
+              Consider expanding the PVC or cleaning up data before it reaches 100%.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-cluster-node-failure.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"
+
+        # P2 — PVC usage above 95% (escalation from P3)
+        - alert: PvcUsageCritical
+          expr: |
+            (
+              kubelet_volume_stats_used_bytes
+              /
+              kubelet_volume_stats_capacity_bytes
+            ) > 0.95
+          for: 5m
+          labels:
+            severity: P2
+            team: sre
+            component: storage
+          annotations:
+            summary: "P2 — PVC {{ $labels.persistentvolumeclaim }} usage above 95% — expand immediately"
+            description: |
+              PVC {{ $labels.persistentvolumeclaim }} in namespace {{ $labels.namespace }}
+              is critically full at {{ $value | humanizePercentage }}.
+              Writes will fail imminently. Expand the PVC or delete data immediately.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-cluster-node-failure.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"
+
+    # ---------------------------------------------------------------------------
+    # ArgoCD
+    # ---------------------------------------------------------------------------
+    - name: infra.argocd
+      interval: 30s
+      rules:
+        # Recording rule — number of healthy ArgoCD apps per cluster
+        - record: argocd:apps_healthy_count
+          expr: |
+            sum by (dest_server) (
+              argocd_app_info{health_status="Healthy"}
+            )
+
+        # Recording rule — number of synced ArgoCD apps per cluster
+        - record: argocd:apps_synced_count
+          expr: |
+            sum by (dest_server) (
+              argocd_app_info{sync_status="Synced"}
+            )
+
+        # ---------------------------------------------------------------------------
+        # P2 — ArgoCD app out of sync for 10 minutes
+        # On eks-test-1 (staging), auto-sync is enabled so drift should self-heal.
+        # On eks-test-2 (prod), OutOfSync is expected after a main branch merge
+        # until Rundeck triggers. This alert helps detect unexpected drift or
+        # broken sync hooks.
+        # ---------------------------------------------------------------------------
+        - alert: ArgoCDSyncFailed
+          expr: |
+            argocd_app_info{sync_status="OutOfSync"} > 0
+          for: 10m
+          labels:
+            severity: P2
+            team: sre
+            component: argocd
+          annotations:
+            summary: "P2 — ArgoCD app {{ $labels.name }} is OutOfSync"
+            description: |
+              ArgoCD application {{ $labels.name }} (project: {{ $labels.project }})
+              has been OutOfSync for 10 minutes.
+              Destination cluster: {{ $labels.dest_server }}.
+              On staging (eks-test-1) this is unexpected — auto-sync should have corrected it.
+              On prod (eks-test-2) verify if a Rundeck deploy is pending.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P2-argocd-sync-failed.md"
+            dashboard: "https://grafana.internal/d/argocd/argocd"
+
+        # ---------------------------------------------------------------------------
+        # P2 — ArgoCD app not Healthy for 10 minutes
+        # An unhealthy application means pods may be crashing, services are
+        # unresponsive, or a deployment is stuck. Investigate immediately.
+        # ---------------------------------------------------------------------------
+        - alert: ArgoCDAppUnhealthy
+          expr: |
+            argocd_app_info{health_status!="Healthy", health_status!="Progressing"} > 0
+          for: 10m
+          labels:
+            severity: P2
+            team: sre
+            component: argocd
+          annotations:
+            summary: "P2 — ArgoCD app {{ $labels.name }} health status: {{ $labels.health_status }}"
+            description: |
+              ArgoCD application {{ $labels.name }} has health status {{ $labels.health_status }}
+              for 10 minutes. This may indicate crashing pods, failed hooks, or
+              degraded downstream resources.
+              Destination cluster: {{ $labels.dest_server }}.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P2-argocd-sync-failed.md"
+            dashboard: "https://grafana.internal/d/argocd/argocd"
+
+        # P2 — ArgoCD application controller is down
+        - alert: ArgoCDControllerDown
+          expr: |
+            absent(up{job="argocd-application-controller"} == 1)
+          for: 5m
+          labels:
+            severity: P2
+            team: sre
+            component: argocd
+          annotations:
+            summary: "P2 — ArgoCD application controller is down"
+            description: |
+              The ArgoCD application controller has not been scraped for 5 minutes.
+              GitOps reconciliation is not running. No changes will be synced to any cluster.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P2-argocd-sync-failed.md"
+            dashboard: "https://grafana.internal/d/argocd/argocd"
+
+    # ---------------------------------------------------------------------------
+    # Certificate Management (cert-manager)
+    # ---------------------------------------------------------------------------
+    - name: infra.certificates
+      interval: 300s
+      rules:
+        # Recording rule — days until certificate expiry
+        - record: certmanager:certificate_days_to_expiry
+          expr: |
+            (certmanager_certificate_expiration_timestamp_seconds - time()) / 86400
+
+        # ---------------------------------------------------------------------------
+        # P2 — Certificate expiring in less than 7 days
+        # cert-manager should auto-renew at ~2/3 of certificate lifetime, so seeing
+        # this alert means auto-renewal has failed. Manual intervention is required.
+        # ---------------------------------------------------------------------------
+        - alert: CertificateExpiringSoon
+          expr: |
+            (certmanager_certificate_expiration_timestamp_seconds - time()) < (7 * 24 * 3600)
+          for: 1h
+          labels:
+            severity: P2
+            team: sre
+            component: cert-manager
+          annotations:
+            summary: "P2 — Certificate {{ $labels.name }} expires in less than 7 days"
+            description: |
+              Certificate {{ $labels.name }} in namespace {{ $labels.namespace }}
+              expires in {{ $value | humanizeDuration }}.
+              cert-manager should have auto-renewed it — auto-renewal appears to have failed.
+              Check cert-manager logs and the Certificate resource status.
+              If this is the Istio root CA, mTLS across the mesh will break on expiry.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P2-certificate-expiry.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"
+
+        # P1 — Certificate expiring in less than 24 hours (escalation)
+        - alert: CertificateExpiringCritical
+          expr: |
+            (certmanager_certificate_expiration_timestamp_seconds - time()) < (24 * 3600)
+          for: 10m
+          labels:
+            severity: P1
+            team: sre
+            component: cert-manager
+          annotations:
+            summary: "P1 — Certificate {{ $labels.name }} expires in less than 24 hours"
+            description: |
+              CRITICAL: Certificate {{ $labels.name }} in namespace {{ $labels.namespace }}
+              expires in {{ $value | humanizeDuration }}.
+              Immediate manual renewal required. If this is an Istio mesh certificate,
+              mTLS will fail across the entire mesh upon expiry.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P2-certificate-expiry.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"
+
+        # P2 — Istio CA certificate nearing expiry
+        - alert: IstioCaCertExpiringSoon
+          expr: |
+            (
+              istio_agent_cert_expiry_seconds{cert_type="istiod-cert"}
+              - time()
+            ) < (30 * 24 * 3600)
+          for: 1h
+          labels:
+            severity: P2
+            team: sre
+            component: istio-ca
+          annotations:
+            summary: "P2 — Istio CA certificate expires in less than 30 days"
+            description: |
+              The Istio intermediate CA certificate expires in
+              {{ $value | humanizeDuration }}. If the CA cert expires, istiod
+              cannot issue workload certificates and mTLS breaks across the mesh.
+              Rotate the cacerts secret before expiry.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P2-certificate-expiry.md"
+            dashboard: "https://grafana.internal/d/istio-mesh/istio-mesh"
+
+    # ---------------------------------------------------------------------------
+    # Kubernetes Workloads
+    # ---------------------------------------------------------------------------
+    - name: infra.workloads
+      interval: 30s
+      rules:
+        # Recording rule — deployment availability ratio
+        - record: deployment:replicas_available_ratio
+          expr: |
+            kube_deployment_status_replicas_available
+            /
+            kube_deployment_spec_replicas
+
+        # P2 — Deployment has less than 50% of desired replicas
+        - alert: DeploymentReplicasLow
+          expr: |
+            (
+              kube_deployment_status_replicas_available
+              /
+              kube_deployment_spec_replicas
+            ) < 0.5
+          for: 5m
+          labels:
+            severity: P2
+            team: sre
+            component: workloads
+          annotations:
+            summary: "P2 — Deployment {{ $labels.deployment }} below 50% replicas"
+            description: |
+              Deployment {{ $labels.deployment }} in namespace {{ $labels.namespace }}
+              has {{ $value | humanizePercentage }} of desired replicas available.
+              Available: {{ with query "kube_deployment_status_replicas_available{deployment='%s',namespace='%s'}" $labels.deployment $labels.namespace }}{{ . | first | value }}{{ end }}
+              Desired: {{ with query "kube_deployment_spec_replicas{deployment='%s',namespace='%s'}" $labels.deployment $labels.namespace }}{{ . | first | value }}{{ end }}.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-high-error-rate.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"
+
+        # P2 — Pod crash looping
+        - alert: PodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total[15m]) > 0
+            and
+            kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"} == 1
+          for: 5m
+          labels:
+            severity: P2
+            team: sre
+            component: workloads
+          annotations:
+            summary: "P2 — Pod {{ $labels.pod }} is crash looping"
+            description: |
+              Pod {{ $labels.pod }} container {{ $labels.container }} in namespace
+              {{ $labels.namespace }} is in CrashLoopBackOff. Check pod logs for errors.
+              This may be a misconfiguration, OOM kill, or application startup failure.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-high-error-rate.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"
+
+        # P3 — HPA at max replicas (scaling ceiling hit)
+        - alert: HpaAtMaxReplicas
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas
+            ==
+            kube_horizontalpodautoscaler_spec_max_replicas
+          for: 15m
+          labels:
+            severity: P3
+            team: sre
+            component: workloads
+          annotations:
+            summary: "P3 — HPA {{ $labels.horizontalpodautoscaler }} at max replicas"
+            description: |
+              HPA {{ $labels.horizontalpodautoscaler }} in namespace {{ $labels.namespace }}
+              has been at its maximum replica count for 15 minutes. Traffic may be shedding.
+              Consider increasing maxReplicas or reviewing resource limits.
+            runbook: "https://github.com/org/plataform-study/blob/main/sre/runbooks/P1-cluster-node-failure.md"
+            dashboard: "https://grafana.internal/d/platform-overview/platform-overview"

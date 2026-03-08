@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: eks-test-1
+  namespace: argocd
+  labels:
+    # This label is required for ArgoCD to recognise the Secret as a cluster registration
+    argocd.argoproj.io/secret-type: cluster
+  annotations:
+    # Human-readable cluster metadata — visible in ArgoCD UI and CLI
+    cluster.argocd.io/name: "eks-test-1"
+    cluster.argocd.io/environment: "staging"
+    cluster.argocd.io/role: "spoke-staging"
+    cluster.argocd.io/region: "us-east-1"
+
+    # Istio topology — matches namespace label topology.istio.io/network
+    istio.io/network: "eks-test-1"
+    istio.io/mesh-role: "multi-primary"
+
+    # Registration provenance — populated by Ansible day-0 playbook
+    # 05-register-argocd.yaml uses istioctl create-remote-secret + argocd cluster add
+    bootstrap.study-platform.io/registered-by: "ansible/playbooks/05-register-argocd.yaml"
+    bootstrap.study-platform.io/registered-at: "PLACEHOLDER_ISO8601"
+
+    # Rundeck references this annotation to resolve cluster → ArgoCD app name
+    rundeck.study-platform.io/argocd-app: "study-platform-test-1"
+
+type: Opaque
+stringData:
+  # ArgoCD cluster registration format
+  # The actual values are written by:
+  #   argocd cluster add eks-test-1 --name eks-test-1 (from Ansible)
+  # or by the Ansible 05-register-argocd.yaml playbook that calls
+  # the ArgoCD API directly. The fields below are the expected schema.
+  name: "eks-test-1"
+
+  # Replace with actual EKS API endpoint from:
+  #   aws eks describe-cluster --name eks-test-1 --query cluster.endpoint
+  server: "https://EKS_TEST_1_API_ENDPOINT"
+
+  config: |
+    {
+      "bearerToken": "PLACEHOLDER_SERVICE_ACCOUNT_TOKEN",
+      "tlsClientConfig": {
+        "insecure": false,
+        "caData": "PLACEHOLDER_BASE64_CA_CERT"
+      },
+      "awsAuthConfig": {
+        "clusterName": "eks-test-1",
+        "roleARN": "arn:aws:iam::ACCOUNT_ID:role/argocd-spoke-eks-test-1"
+      }
+    }

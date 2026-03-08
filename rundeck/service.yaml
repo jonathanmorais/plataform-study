@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rundeck
+  namespace: rundeck
+  labels:
+    app: rundeck
+    app.kubernetes.io/name: rundeck
+    app.kubernetes.io/component: deployment-scheduler
+    app.kubernetes.io/part-of: study-platform-ops
+  annotations:
+    # Internal DNS: rundeck.rundeck.svc.cluster.local
+    # Accessed by engineers at: http://rundeck.eks-ops.internal (via ingress/DNS)
+spec:
+  type: ClusterIP
+  selector:
+    app: rundeck
+  ports:
+    - name: http
+      port: 4440
+      targetPort: 4440
+      protocol: TCP

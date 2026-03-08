@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: study-platform
+  labels:
+    # Enable Istio sidecar injection for all pods in this namespace.
+    # The Istio control plane on eks-test-2 watches this label.
+    istio-injection: enabled
+
+    # Network topology label for Istio multi-primary multi-network routing.
+    # Value MUST match the network name configured in the Istio IstioOperator for eks-test-2.
+    # This differs from eks-test-1 (eks-test-1 vs eks-test-2) — that difference is
+    # what tells Istio that these are separate networks requiring East-West Gateway routing.
+    topology.istio.io/network: eks-test-2
+
+    # Standard Kubernetes labels
+    kubernetes.io/metadata.name: study-platform
+    app.kubernetes.io/part-of: study-platform
+    environment: production
+    cluster: eks-test-2
+
+  annotations:
+    # ArgoCD sync wave: Namespace must exist before any other resource (wave -2)
+    argocd.argoproj.io/sync-wave: "-2"
+
+    # Provenance — managed via GitOps, applied by Rundeck-triggered ArgoCD sync
+    argocd.argoproj.io/managed-by: argocd
+
+    # Istio topology context
+    topology.istio.io/network: eks-test-2

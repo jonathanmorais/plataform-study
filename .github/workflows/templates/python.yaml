@@ -1,0 +1,199 @@
+name: Python — CI/CD Template (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: "Application name"
+        required: true
+        type: string
+      ecr-repo:
+        description: "Full ECR repository URI"
+        required: true
+        type: string
+      python-version:
+        description: "Python version (e.g. 3.12)"
+        required: false
+        type: string
+        default: "3.12"
+      requirements-file:
+        description: "Path to requirements file"
+        required: false
+        type: string
+        default: "requirements.txt"
+      pytest-args:
+        description: "Extra arguments to pass to pytest"
+        required: false
+        type: string
+        default: "--tb=short -q --cov=. --cov-report=xml"
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+      GITOPS_REPO_TOKEN:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  ci:
+    name: Lint & Test — Python ${{ inputs.python-version }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.requirements-file }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r ${{ inputs.requirements-file }}
+          pip install ruff pytest pytest-cov
+
+      - name: Lint with ruff (errors + warnings)
+        run: |
+          ruff check . \
+            --select E,W,F,I,B,C4,UP \
+            --ignore E501 \
+            --output-format github
+
+      - name: Format check with ruff
+        run: ruff format --check .
+
+      - name: Run pytest
+        run: pytest ${{ inputs.pytest-args }}
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONUNBUFFERED: "1"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ inputs.app-name }}
+          path: coverage.xml
+          retention-days: 14
+
+  build-and-deploy:
+    name: Build, Push & GitOps Update
+    needs: ci
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: build-${{ inputs.app-name }}-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve target cluster, overlay and environment
+        id: resolve-target
+        run: |
+          REF="${{ github.ref }}"
+          BRANCH="${REF#refs/heads/}"
+
+          if [[ "$BRANCH" == feature/* ]]; then
+            CLUSTER="eks-test-1"
+            OVERLAY="test-1"
+            ENVIRONMENT="staging"
+          elif [[ "$BRANCH" == incidente/* ]]; then
+            CLUSTER="eks-test-1 eks-test-2"
+            OVERLAY="test-1 test-2"
+            ENVIRONMENT="incident"
+          elif [[ "$BRANCH" == "main" ]]; then
+            CLUSTER="eks-test-2"
+            OVERLAY="test-2"
+            ENVIRONMENT="production"
+          else
+            CLUSTER=""
+            OVERLAY=""
+            ENVIRONMENT="none"
+          fi
+
+          echo "cluster=$CLUSTER"         >> "$GITHUB_OUTPUT"
+          echo "overlay=$OVERLAY"         >> "$GITHUB_OUTPUT"
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ inputs.ecr-repo }}:${{ env.IMAGE_TAG }}
+            ${{ inputs.ecr-repo }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_NAME=${{ inputs.app-name }}
+            GIT_SHA=${{ github.sha }}
+            PYTHON_VERSION=${{ inputs.python-version }}
+
+      - name: Clone GitOps repository
+        if: steps.resolve-target.outputs.environment != 'none'
+        run: |
+          git clone \
+            "https://x-access-token:${{ secrets.GITOPS_REPO_TOKEN }}@github.com/${{ vars.GITOPS_REPO }}.git" \
+            gitops-repo
+          cd gitops-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update kustomization overlays
+        if: steps.resolve-target.outputs.environment != 'none'
+        run: |
+          cd gitops-repo
+          OVERLAYS="${{ steps.resolve-target.outputs.overlay }}"
+          APP="${{ inputs.app-name }}"
+
+          for OVERLAY in $OVERLAYS; do
+            KUSTOMIZE_FILE="apps/${APP}/overlays/${OVERLAY}/kustomization.yaml"
+            if [[ ! -f "$KUSTOMIZE_FILE" ]]; then
+              echo "WARNING: $KUSTOMIZE_FILE not found, skipping overlay $OVERLAY"
+              continue
+            fi
+            yq e -i \
+              "(.images[] | select(.name == \"${{ inputs.ecr-repo }}\")).newTag = \"${{ env.IMAGE_TAG }}\"" \
+              "$KUSTOMIZE_FILE"
+            git add "$KUSTOMIZE_FILE"
+          done
+
+      - name: Commit and push GitOps changes
+        if: steps.resolve-target.outputs.environment != 'none'
+        run: |
+          cd gitops-repo
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          BRANCH_NAME="app/${{ inputs.app-name }}/${{ github.sha }}"
+          git checkout -b "$BRANCH_NAME"
+          git commit -m "chore(${{ inputs.app-name }}): update image to ${{ env.IMAGE_TAG }}
+
+          App:         ${{ inputs.app-name }}
+          Image:       ${{ inputs.ecr-repo }}:${{ env.IMAGE_TAG }}
+          Overlay(s):  ${{ steps.resolve-target.outputs.overlay }}
+          Environment: ${{ steps.resolve-target.outputs.environment }}
+          Source SHA:  ${{ github.sha }}"
+          git push origin "$BRANCH_NAME"

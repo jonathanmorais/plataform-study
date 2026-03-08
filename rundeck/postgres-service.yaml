@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: rundeck
+  labels:
+    app: postgres
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: study-platform-ops
+  annotations:
+    # Internal DNS: postgres.rundeck.svc.cluster.local
+    # Rundeck connects via: jdbc:postgresql://postgres:5432/rundeck
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP

@@ -1,0 +1,12 @@
+---
+# Variables specific to the eks-test-1 (staging) cluster.
+
+cluster_name: eks-test-1
+environment: staging
+istio_network: network-test-1
+kubeconfig_context: "arn:aws:eks:{{ aws_region }}:{{ aws_account_id }}:cluster/eks-test-1"
+
+# ArgoCD sync policy for staging: automatic sync enabled
+argocd_auto_sync: true
+argocd_prune: true
+argocd_self_heal: true

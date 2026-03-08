@@ -1,0 +1,44 @@
+---
+# Dynamic inventory plugin for aws_ec2.
+# Used during AMI build phases to discover builder instances by tag.
+# Requires: amazon.aws collection, valid AWS credentials in environment.
+
+plugin: amazon.aws.aws_ec2
+
+regions:
+  - us-east-1
+
+# Only discover instances that are running or pending.
+filters:
+  instance-state-name:
+    - running
+    - pending
+  "tag:Project":
+    - study-platform
+  "tag:ManagedBy":
+    - ansible-ami-builder
+
+keyed_groups:
+  # Group by the Role tag (e.g., tag_Role_ami_builder)
+  - key: tags.Role
+    prefix: tag_role
+    separator: "_"
+  # Group by environment tag
+  - key: tags.Environment
+    prefix: env
+    separator: "_"
+
+hostnames:
+  - private-ip-address
+  - dns-name
+
+compose:
+  ansible_host: private_ip_address
+  ansible_user: "'ec2-user'"
+  ansible_ssh_private_key_file: "'~/.ssh/eks-study-platform.pem'"
+
+# Cache to avoid repeated API calls within a build run.
+cache: true
+cache_plugin: jsonfile
+cache_connection: /tmp/aws_ec2_inventory_cache
+cache_timeout: 300
